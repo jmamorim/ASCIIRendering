@@ -1,34 +1,29 @@
-// Build (Developer Command Prompt for Visual Studio):
-//   cl /EHsc ascii_ui.cpp
+// Build (Windows, macOS, Linux): see README.md
+//   cmake -S . -B build && cmake --build build
 //
 // Open an image, then drag the sliders to see the ASCII output change live.
 
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+#include "imgui.h"
+#include "imgui_impl_sdl3.h"
+#include "imgui_impl_sdlrenderer3.h"
 
-#include <windows.h>
-#include <commctrl.h>
-#include <commdlg.h>
-#include <gdiplus.h>
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_WINDOWS_UTF8 // SDL hands us UTF-8 paths, also on Windows
+#include "stb_image.h"
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+
+#include "font_data.h" // DejaVu Sans Mono, embedded at build time (assets/)
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <mutex>
 #include <string>
 #include <vector>
-
-#pragma comment(lib, "Comdlg32.lib")
-#pragma comment(lib, "Gdiplus.lib")
-#pragma comment(lib, "Comctl32.lib")
-#pragma comment(lib, "User32.lib")
-#pragma comment(lib, "Gdi32.lib")
-#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
-
-using namespace Gdiplus;
 
 // ---------------------------------------------------------------------------
 // Basic types
@@ -57,97 +52,86 @@ enum { P_COLS, P_STEP, P_CONTRAST, P_RADIUS, P_STAGGER, P_FONT, P_COUNT };
 
 struct Param
 {
-    const wchar_t* name;
+    const char* name;
     int minv, maxv, init; // slider range (integers)
     float scale;          // real value = slider position * scale
     int decimals;         // decimals to show in the label
-    HWND slider;
-    HWND label;
+    int pos;              // current slider position
 };
 
 Param P[P_COUNT] = {
-    { L"Columns",         20, 250, 100, 1.00f, 0, nullptr, nullptr },
-    { L"Sample step",      1,   8,   2, 1.00f, 0, nullptr, nullptr },
-    { L"Contrast",        10,  40,  10, 0.10f, 1, nullptr, nullptr },
-    { L"Circle radius",   15,  45,  30, 0.01f, 2, nullptr, nullptr },
-    { L"Stagger",          0,  10,   4, 0.01f, 2, nullptr, nullptr },
-    { L"Glyph font size", 50, 100,  80, 0.01f, 2, nullptr, nullptr },
+    { "Columns",         20, 250, 100, 1.00f, 0 },
+    { "Sample step",      1,   8,   2, 1.00f, 0 },
+    { "Contrast",        10,  40,  10, 0.10f, 1 },
+    { "Circle radius",   15,  45,  30, 0.01f, 2 },
+    { "Stagger",          0,  10,   4, 0.01f, 2 },
+    { "Glyph font size", 50, 100,  80, 0.01f, 2 },
 };
 
 float val(int i)
 {
-    return (float)SendMessageW(P[i].slider, TBM_GETPOS, 0, 0) * P[i].scale;
+    return (float)P[i].pos * P[i].scale;
 }
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
-const int PANEL_W = 300;
-const int ID_OPEN = 1001;
-const int ID_COPY = 1002;
-const int ID_SLIDER_BASE = 2000;
+const float PANEL_W = 300; // before DPI scaling
 
-HWND g_hwnd = nullptr;
-Bitmap* g_image = nullptr;           // for the preview
+SDL_Window* g_window = nullptr;
+SDL_Renderer* g_renderer = nullptr;
+SDL_Texture* g_image = nullptr;      // for the preview
 Gray g_gray;                         // grayscale copy for sampling
 Circle g_circles[N];
 std::vector<Glyph> g_glyphs;
 std::vector<std::string> g_lines;    // current ASCII output
+stbtt_fontinfo g_font;               // glyph font for the shape vectors
 
 // ---------------------------------------------------------------------------
-// File picker
+// File picker. SDL may call back on another thread, so the main loop picks
+// the result up from here.
 // ---------------------------------------------------------------------------
-std::wstring PickImageFile(HWND owner)
+std::mutex g_pickedMutex;
+std::string g_picked;
+
+void SDLCALL onFilePicked(void*, const char* const* files, int)
 {
-    OPENFILENAMEW ofn;
-    WCHAR szFile[MAX_PATH] = { 0 };
+    if (!files || !files[0]) return; // error or cancelled
+    std::lock_guard<std::mutex> lock(g_pickedMutex);
+    g_picked = files[0];
+}
 
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = owner;
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"Image Files\0*.bmp;*.jpg;*.jpeg;*.png;*.gif\0All Files\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_EXPLORER;
-
-    if (GetOpenFileNameW(&ofn))
-        return std::wstring(szFile);
-    return std::wstring();
+void PickImageFile()
+{
+    static const SDL_DialogFileFilter filters[] = {
+        { "Image Files", "bmp;jpg;jpeg;png;gif;tga;psd" },
+        { "All Files", "*" },
+    };
+    SDL_ShowOpenFileDialog(onFilePicked, nullptr, g_window, filters, 2, nullptr, false);
 }
 
 // ---------------------------------------------------------------------------
-// Bitmap -> grayscale buffer (LockBits = fast, reads the raw pixel memory)
+// RGBA pixels -> grayscale buffer
 // ---------------------------------------------------------------------------
-Gray toGray(Bitmap& bmp)
+Gray toGray(const unsigned char* rgba, int w, int h)
 {
     Gray g;
-    int w = (int)bmp.GetWidth();
-    int h = (int)bmp.GetHeight();
-
-    BitmapData bd;
-    Rect rect(0, 0, w, h);
-    if (bmp.LockBits(&rect, ImageLockModeRead, PixelFormat32bppARGB, &bd) != Ok)
-        return g;
-
     g.w = w;
     g.h = h;
     g.px.resize((size_t)w * h);
 
     for (int y = 0; y < h; ++y)
     {
-        const BYTE* row = (const BYTE*)bd.Scan0 + (ptrdiff_t)y * bd.Stride;
+        const unsigned char* row = rgba + (size_t)y * w * 4;
         for (int x = 0; x < w; ++x)
         {
-            // memory order is B, G, R, A
-            float b = row[x * 4 + 0];
+            // memory order is R, G, B, A
+            float r = row[x * 4 + 0];
             float gg = row[x * 4 + 1];
-            float r = row[x * 4 + 2];
+            float b = row[x * 4 + 2];
             g.px[(size_t)y * w + x] = (0.2126f * r + 0.7152f * gg + 0.0722f * b) / 255.0f;
         }
     }
-
-    bmp.UnlockBits(&bd);
     return g;
 }
 
@@ -235,28 +219,44 @@ std::vector<Glyph> buildGlyphs(float fontScale)
     const int gw = 8 * 4;   // glyph cell 8x16, rendered 4x bigger
     const int gh = 16 * 4;
 
-    Bitmap bmp(gw, gh, PixelFormat32bppARGB);
-    Graphics g(&bmp);
-    g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+    // Font size in pixels per em, like GDI+ UnitPixel
+    float scale = stbtt_ScaleForMappingEmToPixels(&g_font, gh * fontScale);
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(&g_font, &ascent, &descent, &lineGap);
+    // Center the line box vertically (ascent to descent), like StringAlignmentCenter
+    float baseline = (gh - (ascent - descent) * scale) / 2 + ascent * scale;
 
-    FontFamily family(L"Consolas");
-    Font font(&family, gh * fontScale, FontStyleRegular, UnitPixel);
-    SolidBrush white(Color(255, 255, 255, 255));
-
-    StringFormat fmt(StringFormat::GenericTypographic());
-    fmt.SetAlignment(StringAlignmentCenter);
-    fmt.SetLineAlignment(StringAlignmentCenter);
-    RectF rect(0.0f, 0.0f, (REAL)gw, (REAL)gh);
+    Gray gray;
+    gray.w = gw;
+    gray.h = gh;
 
     std::vector<Glyph> glyphs;
 
     for (char c = 32; c < 127; ++c)
     {
-        g.Clear(Color(255, 0, 0, 0));
-        WCHAR wc = (WCHAR)c;
-        g.DrawString(&wc, 1, &font, rect, &fmt, &white);
+        gray.px.assign((size_t)gw * gh, 0.0f); // black cell
 
-        Gray gray = toGray(bmp);
+        // Center the character's advance horizontally
+        int advance, lsb;
+        stbtt_GetCodepointHMetrics(&g_font, c, &advance, &lsb);
+        float x = (gw - advance * scale) / 2;
+
+        // Draw white text: coverage 0..255 becomes lightness 0..1
+        int ox = (int)std::floor(x), oy = (int)std::floor(baseline);
+        int bw, bh, xoff, yoff;
+        unsigned char* bmp = stbtt_GetCodepointBitmapSubpixel(&g_font, scale, scale,
+            x - ox, baseline - oy, c, &bw, &bh, &xoff, &yoff);
+        for (int y = 0; y < bh; ++y)
+        {
+            for (int xx = 0; xx < bw; ++xx)
+            {
+                int px = ox + xoff + xx, py = oy + yoff + y;
+                if (px < 0 || py < 0 || px >= gw || py >= gh) continue;
+                gray.px[(size_t)py * gw + px] = bmp[y * bw + xx] / 255.0f;
+            }
+        }
+        stbtt_FreeBitmap(bmp, nullptr);
+
         Glyph gl;
         gl.ch = c;
         gl.v = sampleCell(gray, 0, 0, (float)gw, (float)gh, 1);
@@ -356,28 +356,8 @@ void renderAscii()
 // ---------------------------------------------------------------------------
 // UI helpers
 // ---------------------------------------------------------------------------
-RECT asciiArea()
-{
-    RECT rc;
-    GetClientRect(g_hwnd, &rc);
-    rc.left = PANEL_W;
-    return rc;
-}
-
-void updateLabels()
-{
-    for (int i = 0; i < P_COUNT; ++i)
-    {
-        wchar_t buf[64];
-        swprintf_s(buf, L"%s: %.*f", P[i].name, P[i].decimals, val(i));
-        SetWindowTextW(P[i].label, buf);
-    }
-}
-
 void onParamsChanged()
 {
-    updateLabels();
-
     // Glyph shape vectors only depend on these three, so only rebuild if they changed
     float r = val(P_RADIUS), s = val(P_STAGGER), f = val(P_FONT);
     static float lr = -1, ls = -1, lf = -1;
@@ -389,27 +369,27 @@ void onParamsChanged()
     }
 
     renderAscii();
-
-    RECT area = asciiArea();
-    InvalidateRect(g_hwnd, &area, FALSE);
 }
 
-void loadImage(const std::wstring& path)
+void loadImage(const std::string& path)
 {
-    Bitmap* b = Bitmap::FromFile(path.c_str());
-    if (!b || b->GetLastStatus() != Ok)
+    int w, h, n;
+    unsigned char* rgba = stbi_load(path.c_str(), &w, &h, &n, 4);
+    if (!rgba)
     {
-        delete b;
-        MessageBoxW(g_hwnd, L"Could not load the image.", L"Error", MB_ICONERROR);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Could not load the image.", g_window);
         return;
     }
 
-    delete g_image;
-    g_image = b;
-    g_gray = toGray(*g_image);
+    SDL_Texture* tex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);
+    if (tex) SDL_UpdateTexture(tex, nullptr, rgba, w * 4);
+
+    SDL_DestroyTexture(g_image);
+    g_image = tex;
+    g_gray = toGray(rgba, w, h);
+    stbi_image_free(rgba);
 
     onParamsChanged();
-    InvalidateRect(g_hwnd, nullptr, FALSE); // repaint preview too
 }
 
 void copyToClipboard()
@@ -417,223 +397,200 @@ void copyToClipboard()
     if (g_lines.empty()) return;
 
     std::string text;
-    for (const std::string& l : g_lines) { text += l; text += "\r\n"; }
-
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
-    if (!h) return;
-    memcpy(GlobalLock(h), text.c_str(), text.size() + 1);
-    GlobalUnlock(h);
-
-    if (OpenClipboard(g_hwnd))
-    {
-        EmptyClipboard();
-        SetClipboardData(CF_TEXT, h);
-        CloseClipboard();
-    }
+    for (const std::string& l : g_lines) { text += l; text += "\n"; }
+    SDL_SetClipboardText(text.c_str());
 }
 
 // ---------------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------------
-void paintAscii(HDC hdc, const RECT& area)
+void paintAscii(ImFont* font)
 {
-    int aw = area.right - area.left;
-    int ah = area.bottom - area.top;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImVec2 size = ImGui::GetContentRegionAvail();
+    int aw = (int)size.x;
+    int ah = (int)size.y;
     if (aw <= 0 || ah <= 0) return;
 
-    // Draw into an off-screen bitmap first so there is no flicker
-    HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, aw, ah);
-    HGDIOBJ oldBmp = SelectObject(mem, bmp);
-
-    RECT full = { 0, 0, aw, ah };
-    FillRect(mem, &full, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    SetBkMode(mem, TRANSPARENT);
+    dl->AddRectFilled(p, ImVec2(p.x + aw, p.y + ah), IM_COL32(0, 0, 0, 255));
 
     if (g_lines.empty())
     {
-        HGDIOBJ oldFont = SelectObject(mem, GetStockObject(DEFAULT_GUI_FONT));
-        SetTextColor(mem, RGB(160, 160, 160));
-        const wchar_t* hint = L"Click \"Open image...\" to start";
-        TextOutW(mem, 20, 20, hint, (int)wcslen(hint));
-        SelectObject(mem, oldFont);
-    }
-    else
-    {
-        int rows = (int)g_lines.size();
-        int cols = (int)g_lines[0].size();
-
-        // Largest character cell (width cell, height 2*cell) that fits the area
-        int c1 = aw / cols;
-        int c2 = ah / (rows * 2);
-        int cell = c1 < c2 ? c1 : c2;
-        if (cell < 2) cell = 2;
-
-        HFONT font = CreateFontW(-(cell * 182 / 100), cell, 0, 0, FW_NORMAL, 0, 0, 0,
-            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-        HGDIOBJ oldFont = SelectObject(mem, font);
-        SetTextColor(mem, RGB(255, 255, 255));
-
-        for (int i = 0; i < rows; ++i)
-            TextOutA(mem, 0, i * cell * 2, g_lines[i].c_str(), (int)g_lines[i].size());
-
-        SelectObject(mem, oldFont);
-        DeleteObject(font);
+        dl->AddText(ImVec2(p.x + 20, p.y + 20), IM_COL32(160, 160, 160, 255),
+            "Click \"Open image...\" or drop an image here to start");
+        return;
     }
 
-    BitBlt(hdc, area.left, area.top, aw, ah, mem, 0, 0, SRCCOPY);
+    int rows = (int)g_lines.size();
+    int cols = (int)g_lines[0].size();
 
-    SelectObject(mem, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
+    // Largest character cell (width cell, height 2*cell) that fits the area
+    int c1 = aw / cols;
+    int c2 = ah / (rows * 2);
+    int cell = c1 < c2 ? c1 : c2;
+    if (cell < 2) cell = 2;
+
+    // Font size whose character advance is exactly one cell
+    float advance = font->CalcTextSizeA(100.0f, FLT_MAX, 0.0f, "M").x / 100.0f;
+    float fontSize = cell / advance;
+
+    for (int i = 0; i < rows; ++i)
+        dl->AddText(font, fontSize, ImVec2(p.x, p.y + (float)(i * cell * 2)),
+            IM_COL32(255, 255, 255, 255), g_lines[i].c_str());
 }
 
-void paintPreview(HDC hdc, const RECT& client)
+void paintPreview()
 {
     if (!g_image) return;
 
-    int x = 10;
-    int y = 50 + P_COUNT * 54 + 10;
-    int maxW = PANEL_W - 20;
-    int maxH = client.bottom - y - 10;
-    if (maxH < 20) return;
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.y < 20) return;
 
-    float iw = (float)g_image->GetWidth();
-    float ih = (float)g_image->GetHeight();
-    float scale = maxW / iw;
-    if (maxH / ih < scale) scale = maxH / ih;
+    float iw, ih;
+    SDL_GetTextureSize(g_image, &iw, &ih);
+    float scale = avail.x / iw;
+    if (avail.y / ih < scale) scale = avail.y / ih;
 
-    Graphics gfx(hdc);
-    gfx.DrawImage(g_image, x, y, (INT)(iw * scale), (INT)(ih * scale));
+    ImGui::Image((ImTextureID)(intptr_t)g_image, ImVec2(iw * scale, ih * scale));
 }
 
-// ---------------------------------------------------------------------------
-// Window procedure
-// ---------------------------------------------------------------------------
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+void drawUi(float dpi, ImFont* font)
 {
-    switch (msg)
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(io.DisplaySize);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::Begin("ASCII renderer", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::PopStyleVar(2);
+
+    // Left panel: buttons, sliders, preview
+    ImGui::BeginChild("panel", ImVec2(PANEL_W * dpi, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+    float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
+    if (ImGui::Button("Open image...", ImVec2(half, 0)))
+        PickImageFile();
+    ImGui::SameLine();
+    if (ImGui::Button("Copy text", ImVec2(half, 0)))
+        copyToClipboard();
+    ImGui::Spacing();
+
+    bool changed = false;
+    for (int i = 0; i < P_COUNT; ++i)
     {
-    case WM_CREATE:
-    {
-        g_hwnd = hwnd;
-        HINSTANCE hInst = ((LPCREATESTRUCT)lParam)->hInstance;
-        HFONT guiFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-
-        HWND bOpen = CreateWindowExW(0, L"BUTTON", L"Open image...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            10, 10, 135, 28, hwnd, (HMENU)(INT_PTR)ID_OPEN, hInst, nullptr);
-        HWND bCopy = CreateWindowExW(0, L"BUTTON", L"Copy text", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            155, 10, 135, 28, hwnd, (HMENU)(INT_PTR)ID_COPY, hInst, nullptr);
-        SendMessageW(bOpen, WM_SETFONT, (WPARAM)guiFont, TRUE);
-        SendMessageW(bCopy, WM_SETFONT, (WPARAM)guiFont, TRUE);
-
-        for (int i = 0; i < P_COUNT; ++i)
-        {
-            int y = 50 + i * 54;
-
-            P[i].label = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                10, y, 280, 18, hwnd, nullptr, hInst, nullptr);
-            SendMessageW(P[i].label, WM_SETFONT, (WPARAM)guiFont, TRUE);
-
-            P[i].slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-                WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-                10, y + 18, 280, 28, hwnd,
-                (HMENU)(INT_PTR)(ID_SLIDER_BASE + i), hInst, nullptr);
-            SendMessageW(P[i].slider, TBM_SETRANGE, TRUE, MAKELONG(P[i].minv, P[i].maxv));
-            SendMessageW(P[i].slider, TBM_SETPOS, TRUE, P[i].init);
-        }
-
-        onParamsChanged(); // builds glyphs, fills labels
-        return 0;
+        ImGui::Text("%s: %.*f", P[i].name, P[i].decimals, val(i));
+        ImGui::PushID(i);
+        ImGui::SetNextItemWidth(-1);
+        changed |= ImGui::SliderInt("##slider", &P[i].pos, P[i].minv, P[i].maxv, "");
+        ImGui::PopID();
     }
+    if (changed) onParamsChanged();
 
-    case WM_HSCROLL:
-        onParamsChanged();
-        return 0;
+    ImGui::Spacing();
+    paintPreview();
+    ImGui::EndChild();
 
-    case WM_COMMAND:
-        if (LOWORD(wParam) == ID_OPEN)
-        {
-            std::wstring path = PickImageFile(hwnd);
-            if (!path.empty()) loadImage(path);
-        }
-        else if (LOWORD(wParam) == ID_COPY)
-        {
-            copyToClipboard();
-        }
-        return 0;
+    // Right: the ASCII output
+    ImGui::SameLine(0, 0);
+    ImGui::BeginChild("ascii", ImVec2(0, 0), ImGuiChildFlags_None,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    paintAscii(font);
+    ImGui::EndChild();
 
-    case WM_SIZE:
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-
-    case WM_ERASEBKGND:
-        return 1; 
-
-    case WM_PAINT:
-    {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-
-        RECT client;
-        GetClientRect(hwnd, &client);
-
-        RECT panel = { 0, 0, PANEL_W, client.bottom };
-        FillRect(hdc, &panel, (HBRUSH)(COLOR_BTNFACE + 1));
-        paintPreview(hdc, client);
-
-        RECT area = asciiArea();
-        paintAscii(hdc, area);
-
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-
-    case WM_DESTROY:
-        delete g_image;
-        g_image = nullptr;
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+    ImGui::End();
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow)
+int main(int argc, char** argv)
 {
-    GdiplusStartupInput gdiplusStartupInput;
-    ULONG_PTR gdiplusToken;
-    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr);
-
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
-    InitCommonControlsEx(&icc);
-
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = L"AsciiUiWindow";
-    RegisterClassExW(&wc);
-
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"ASCII renderer",
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1200, 800,
-        nullptr, nullptr, hInst, nullptr);
-    ShowWindow(hwnd, nShow);
-    UpdateWindow(hwnd);
-
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0))
+    if (!SDL_Init(SDL_INIT_VIDEO))
     {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        SDL_Log("SDL_Init failed: %s", SDL_GetError());
+        return 1;
     }
 
-    GdiplusShutdown(gdiplusToken);
-    return (int)msg.wParam;
+    float dpi = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+    if (dpi <= 0) dpi = 1;
+    g_window = SDL_CreateWindow("ASCII renderer", (int)(1200 * dpi), (int)(800 * dpi),
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    g_renderer = g_window ? SDL_CreateRenderer(g_window, nullptr) : nullptr;
+    if (!g_renderer)
+    {
+        SDL_Log("Could not create the window: %s", SDL_GetError());
+        return 1;
+    }
+    SDL_SetRenderVSync(g_renderer, 1);
+
+    stbtt_InitFont(&g_font, font_data, stbtt_GetFontOffsetForIndex(font_data, 0));
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ScaleAllSizes(dpi);
+    style.FontScaleDpi = dpi;
+
+    // Same font for the UI and the ASCII output
+    ImFontConfig cfg;
+    cfg.FontDataOwnedByAtlas = false;
+    ImFont* font = io.Fonts->AddFontFromMemoryTTF((void*)font_data, (int)sizeof(font_data), 15.0f, &cfg);
+
+    ImGui_ImplSDL3_InitForSDLRenderer(g_window, g_renderer);
+    ImGui_ImplSDLRenderer3_Init(g_renderer);
+
+    for (Param& p : P) p.pos = p.init;
+    onParamsChanged(); // builds glyphs
+    if (argc > 1) loadImage(argv[1]);
+
+    bool done = false;
+    while (!done)
+    {
+        // Sleep until something happens; the timeout picks up file dialog results
+        SDL_Event e;
+        if (SDL_WaitEventTimeout(&e, 100))
+        {
+            do
+            {
+                ImGui_ImplSDL3_ProcessEvent(&e);
+                if (e.type == SDL_EVENT_QUIT) done = true;
+                if (e.type == SDL_EVENT_DROP_FILE) loadImage(e.drop.data);
+            } while (SDL_PollEvent(&e));
+        }
+
+        std::string picked;
+        {
+            std::lock_guard<std::mutex> lock(g_pickedMutex);
+            picked.swap(g_picked);
+        }
+        if (!picked.empty()) loadImage(picked);
+
+        if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) continue;
+
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+        drawUi(dpi, font);
+        ImGui::Render();
+
+        SDL_SetRenderScale(g_renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
+        SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+        SDL_RenderClear(g_renderer);
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_renderer);
+        SDL_RenderPresent(g_renderer);
+    }
+
+    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
+    SDL_DestroyTexture(g_image);
+    SDL_DestroyRenderer(g_renderer);
+    SDL_DestroyWindow(g_window);
+    SDL_Quit();
+    return 0;
 }

@@ -1,7 +1,0 @@
-<Solution>
-  <Configurations>
-    <Platform Name="x64" />
-    <Platform Name="x86" />
-  </Configurations>
-  <Project Path="ASCIIRendering/ASCIIRendering.vcxproj" Id="b4f74837-e20c-4398-bb8c-838c1ba30597" />
-</Solution>

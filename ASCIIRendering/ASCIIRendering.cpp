@@ -1,7 +1,8 @@
 // Build (Windows, macOS, Linux): see README.md
 //   cmake -S . -B build && cmake --build build
 //
-// Open an image, then drag the sliders to see the ASCII output change live.
+// Open an image, GIF or video, then drag the sliders to see the ASCII output
+// change live. Videos are decoded by the ffmpeg program, which must be on PATH.
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -19,10 +20,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -38,6 +43,20 @@ struct Gray
 };
 
 struct Circle { float cx, cy, r; }; // cx, cy: fraction of cell; r: fraction of cell width
+
+const int ECC = 10; // external circles per cell
+using ExtVec = std::array<float, ECC>;
+Circle g_extCircles[ECC];
+
+// which external circles affect an internal circle
+const std::vector<int> AFFECTING[N] = {
+    {0, 1, 2, 4},
+    {0, 1, 3, 5},
+    {2, 4, 6},
+    {3, 5, 7},
+    {4, 6, 8, 9},
+    {5, 7, 8, 9},
+};
 
 struct Glyph
 {
@@ -104,7 +123,7 @@ void SDLCALL onFilePicked(void*, const char* const* files, int)
 void PickImageFile()
 {
     static const SDL_DialogFileFilter filters[] = {
-        { "Image Files", "bmp;jpg;jpeg;png;gif;tga;psd" },
+        { "Images, GIFs and videos", "bmp;jpg;jpeg;png;gif;tga;psd;mp4;mkv;webm;mov;avi;m4v" },
         { "All Files", "*" },
     };
     SDL_ShowOpenFileDialog(onFilePicked, nullptr, g_window, filters, 2, nullptr, false);
@@ -163,50 +182,64 @@ void layoutCircles(float radius, float stagger)
             c.r = radius;
         }
     }
+
+    const float ex[ECC] = {  0.27f,  0.73f,  0.27f,  0.73f, -0.20f, -0.20f, -0.20f, 1.20f, 1.20f, 1.20f };
+    const float ey[ECC] = { -0.15f, -0.15f,  1.15f,  1.15f,  0.20f,  0.50f,  0.80f, 0.20f, 0.50f, 0.80f };
+    for (int i = 0; i < ECC; ++i)
+        g_extCircles[i] = { ex[i], ey[i], radius };
 }
+
 
 // Average lightness of the pixels inside one circle.
 // `step` = supersampling knob (1 = every pixel, 2 = every other pixel, ...)
 float sampleCircle(const Gray& g, float ox, float oy, float cw, float ch,
     const Circle& c, int step)
-{
-    float cx = ox + c.cx * cw;
-    float cy = oy + c.cy * ch;
-    float r = c.r * cw;
-
-    int x0 = (int)std::floor(cx - r), x1 = (int)std::ceil(cx + r);
-    int y0 = (int)std::floor(cy - r), y1 = (int)std::ceil(cy + r);
-
-    float sum = 0.0f;
-    int count = 0;
-
-    for (int y = y0; y <= y1; y += step)
     {
-        for (int x = x0; x <= x1; x += step)
+        float cx = ox + c.cx * cw;
+        float cy = oy + c.cy * ch;
+        float r = c.r * cw;
+        
+        int x0 = (int)std::floor(cx - r), x1 = (int)std::ceil(cx + r);
+        int y0 = (int)std::floor(cy - r), y1 = (int)std::ceil(cy + r);
+        
+        float sum = 0.0f;
+        int count = 0;
+        
+        for (int y = y0; y <= y1; y += step)
         {
-            if (x < 0 || y < 0 || x >= g.w || y >= g.h) continue;
-
-            float dx = x + 0.5f - cx;
-            float dy = y + 0.5f - cy;
-            if (dx * dx + dy * dy > r * r) continue; // outside the circle
-
-            sum += g.px[(size_t)y * g.w + x];
-            ++count;
+            for (int x = x0; x <= x1; x += step)
+            {
+                if (x < 0 || y < 0 || x >= g.w || y >= g.h) continue;
+                
+                float dx = x + 0.5f - cx;
+                float dy = y + 0.5f - cy;
+                if (dx * dx + dy * dy > r * r) continue; // outside the circle
+                
+                sum += g.px[(size_t)y * g.w + x];
+                ++count;
+            }
         }
+        
+        if (count > 0) return sum / count;
+        
+        // Circle was tiny or the step skipped everything: fall back to the center pixel.
+        int px = (int)cx, py = (int)cy;
+        if (px >= 0 && py >= 0 && px < g.w && py < g.h) return g.px[(size_t)py * g.w + px];
+        return 0.0f;
     }
 
-    if (count > 0) return sum / count;
-
-    // Circle was tiny or the step skipped everything: fall back to the center pixel.
-    int px = (int)cx, py = (int)cy;
-    if (px >= 0 && py >= 0 && px < g.w && py < g.h) return g.px[(size_t)py * g.w + px];
-    return 0.0f;
-}
-
-Vec sampleCell(const Gray& g, float ox, float oy, float cw, float ch, int step)
-{
-    Vec v;
-    for (int i = 0; i < N; ++i)
+    ExtVec sampleExternal(const Gray& g, float ox, float oy, float cw, float ch, int step)
+    {
+        ExtVec e;
+        for(int i = 0; i < ECC; i++)
+            e[i] = sampleCircle(g, ox, oy, cw, ch, g_extCircles[i], step);
+        return e;
+    }
+    
+    Vec sampleCell(const Gray& g, float ox, float oy, float cw, float ch, int step)
+    {
+        Vec v;
+        for (int i = 0; i < N; ++i)
         v[i] = sampleCircle(g, ox, oy, cw, ch, g_circles[i], step);
     return v;
 }
@@ -286,6 +319,17 @@ void enhanceContrast(Vec& v, float exponent)
         v[i] = std::pow(v[i] / m, exponent) * m;
 }
 
+void enhanceDirectional(Vec& v, const ExtVec& ext, float exponent)
+{
+    for (int i = 0; i < N; ++i)
+    {
+        float m = v[i];                          // the circle's own value
+        for (int e : AFFECTING[i])               // plus the external circles that affect it
+            if (ext[e] > m) m = ext[e];
+        if (m > 0.0f) v[i] = std::pow(v[i] / m, exponent) * m;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Nearest neighbor lookup.
 //
@@ -346,7 +390,12 @@ void renderAscii()
         for (int c = 0; c < cols; ++c)
         {
             Vec v = sampleCell(g_gray, c * cw, r * ch, cw, ch, step);
-            if (exponent > 1.001f) enhanceContrast(v, exponent);
+            if (exponent > 1.001f) 
+            {
+                ExtVec ext = sampleExternal(g_gray, c * cw, r * ch, cw, ch, step);
+                enhanceDirectional(v, ext, exponent);
+                enhanceContrast(v, exponent);
+            }
             line += findBestChar(g_glyphs, v);
         }
         g_lines.push_back(line);
@@ -371,25 +420,349 @@ void onParamsChanged()
     renderAscii();
 }
 
-void loadImage(const std::string& path)
+// ---------------------------------------------------------------------------
+// Media: a still image, a GIF or a video. Animated media is converted one
+// frame at a time with the same code as a still image (showFrame).
+// ---------------------------------------------------------------------------
+enum MediaKind { M_NONE, M_IMAGE, M_GIF, M_VIDEO };
+
+MediaKind g_kind = M_NONE;
+int g_mediaW = 0, g_mediaH = 0;
+bool g_playing = false;
+double g_time = 0;      // playback position, seconds
+double g_duration = 0;  // 0 = unknown
+int g_frameShown = -1;  // index of the frame in g_gray / g_lines
+
+// GIF: every frame is decoded up front
+std::vector<unsigned char> g_gifPixels; // RGBA, frame after frame
+std::vector<double> g_gifStart;         // start time of each frame, seconds
+
+// Video: the ffmpeg program decodes it and writes raw RGBA frames to a pipe.
+// A reader thread holds back each frame until the playback clock reaches it,
+// so when converting is slower than the video, frames are skipped.
+struct Video
+{
+    std::string path;
+    int w = 0, h = 0;
+    double fps = 0;
+    std::string rate;            // fps as ffprobe wrote it, e.g. "30000/1001"
+    SDL_Process* proc = nullptr;
+    std::thread reader;
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<unsigned char> frame; // latest frame read, guarded by m
+    int frameIdx = -1;                // its index, -1 = none yet
+    int wanted = 0;                   // reader may hand over frames up to this index
+    int first = 0;                    // index of the first frame ffmpeg sends (seek point)
+    bool eof = false;
+    std::atomic<bool> stop{ false };
+};
+Video g_video;
+std::vector<unsigned char> g_videoFrame; // the frame the main thread is converting
+
+void createPreview(int w, int h, SDL_TextureAccess access)
+{
+    SDL_DestroyTexture(g_image);
+    g_image = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, access, w, h);
+    g_mediaW = w;
+    g_mediaH = h;
+}
+
+void showFrame(const unsigned char* rgba)
+{
+    if (g_image) SDL_UpdateTexture(g_image, nullptr, rgba, g_mediaW * 4);
+    g_gray = toGray(rgba, g_mediaW, g_mediaH);
+    renderAscii();
+}
+
+void videoReader()
+{
+    Video& v = g_video;
+    SDL_IOStream* out = SDL_GetProcessOutput(v.proc);
+    size_t size = (size_t)v.w * v.h * 4;
+    std::vector<unsigned char> buf(size);
+
+    for (int idx = v.first; ; ++idx)
+    {
+        size_t got = 0;
+        while (got < size && !v.stop)
+        {
+            size_t n = SDL_ReadIO(out, buf.data() + got, size - got);
+            got += n;
+            if (n > 0) continue;
+            if (SDL_GetIOStatus(out) != SDL_IO_STATUS_NOT_READY) break; // end of video or error
+            SDL_Delay(1);
+        }
+
+        std::unique_lock<std::mutex> lock(v.m);
+        if (got < size)
+        {
+            v.eof = true;
+            return;
+        }
+        v.cv.wait(lock, [&] { return v.stop || idx <= v.wanted; });
+        if (v.stop) return;
+        v.frame.swap(buf);
+        v.frameIdx = idx;
+    }
+}
+
+void stopVideo()
+{
+    Video& v = g_video;
+    if (!v.proc) return;
+    {
+        std::lock_guard<std::mutex> lock(v.m);
+        v.stop = true;
+    }
+    v.cv.notify_all();
+    SDL_KillProcess(v.proc, true);
+    if (v.reader.joinable()) v.reader.join();
+    SDL_WaitProcess(v.proc, true, nullptr);
+    SDL_DestroyProcess(v.proc);
+    v.proc = nullptr;
+}
+
+// (Re)start ffmpeg at `t` seconds
+bool startVideo(double t)
+{
+    stopVideo();
+    Video& v = g_video;
+    std::string ss = std::to_string(t);
+    std::string vf = "fps=" + v.rate; // constant frame rate, so frame index = time * fps
+    const char* args[] = { "ffmpeg", "-v", "error", "-nostdin", "-ss", ss.c_str(),
+        "-i", v.path.c_str(), "-map", "0:v:0", "-vf", vf.c_str(),
+        "-f", "rawvideo", "-pix_fmt", "rgba", "-", nullptr };
+    v.proc = SDL_CreateProcess(args, true);
+    if (!v.proc) return false;
+
+    v.first = (int)std::lround(t * v.fps);
+    v.wanted = v.first;
+    v.frameIdx = -1;
+    v.eof = false;
+    v.stop = false;
+    v.frame.assign((size_t)v.w * v.h * 4, 0);
+    g_frameShown = -1;
+    v.reader = std::thread(videoReader);
+    return true;
+}
+
+double parseRate(const char* s)
+{
+    int num = 0, den = 0;
+    if (std::sscanf(s, "%d/%d", &num, &den) != 2 || num <= 0 || den <= 0) return 0;
+    return (double)num / den;
+}
+
+// Size, frame rate and length of the first video stream, from ffprobe
+bool probeVideo(const std::string& path, Video& v, double& duration)
+{
+    const char* args[] = { "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate:stream_side_data=rotation:format=duration",
+        "-of", "default=noprint_wrappers=1", path.c_str(), nullptr };
+    SDL_Process* proc = SDL_CreateProcess(args, true);
+    if (!proc) return false;
+    size_t len = 0;
+    int exitCode = -1;
+    char* out = (char*)SDL_ReadProcess(proc, &len, &exitCode);
+    SDL_DestroyProcess(proc);
+    if (!out) return false;
+
+    int w = 0, h = 0, rotation = 0;
+    double avgRate = 0, baseRate = 0;
+    std::string avgText, baseText;
+    duration = 0;
+
+    std::string text(out, len);
+    SDL_free(out);
+    size_t pos = 0;
+    while (pos < text.size())
+    {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(pos, end - pos);
+        pos = end + 1;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq), value = line.substr(eq + 1);
+        if (!value.empty() && value.back() == '\r') value.pop_back();
+
+        if (key == "width") w = std::atoi(value.c_str());
+        else if (key == "height") h = std::atoi(value.c_str());
+        else if (key == "rotation") rotation = std::atoi(value.c_str());
+        else if (key == "duration") duration = std::atof(value.c_str()); // "N/A" -> 0
+        else if (key == "avg_frame_rate") { avgRate = parseRate(value.c_str()); avgText = value; }
+        else if (key == "r_frame_rate") { baseRate = parseRate(value.c_str()); baseText = value; }
+    }
+
+    if (exitCode != 0 || w <= 0 || h <= 0) return false;
+    if (avgRate <= 0 && baseRate <= 0) return false; // still image ffmpeg can read, not a video
+
+    // ffmpeg turns rotated (phone) videos upright, so the frames come out with the sides swapped
+    if (std::abs(rotation) % 180 == 90) std::swap(w, h);
+
+    v.path = path;
+    v.w = w;
+    v.h = h;
+    v.fps = avgRate > 0 ? avgRate : baseRate;
+    v.rate = avgRate > 0 ? avgText : baseText;
+    return true;
+}
+
+void startMedia(MediaKind kind, double duration)
+{
+    g_kind = kind;
+    g_duration = duration;
+    g_time = 0;
+    g_playing = kind == M_GIF || kind == M_VIDEO;
+    g_frameShown = -1;
+    g_gray = Gray();
+    g_lines.clear();
+}
+
+bool loadImage(const std::string& path)
 {
     int w, h, n;
     unsigned char* rgba = stbi_load(path.c_str(), &w, &h, &n, 4);
-    if (!rgba)
-    {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Could not load the image.", g_window);
-        return;
-    }
+    if (!rgba) return false;
 
-    SDL_Texture* tex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);
-    if (tex) SDL_UpdateTexture(tex, nullptr, rgba, w * 4);
-
-    SDL_DestroyTexture(g_image);
-    g_image = tex;
-    g_gray = toGray(rgba, w, h);
+    stopVideo();
+    startMedia(M_IMAGE, 0);
+    createPreview(w, h, SDL_TEXTUREACCESS_STATIC);
+    showFrame(rgba);
     stbi_image_free(rgba);
+    return true;
+}
 
-    onParamsChanged();
+bool isGif(const std::string& path)
+{
+    char magic[4] = {};
+    SDL_IOStream* io = SDL_IOFromFile(path.c_str(), "rb");
+    if (!io) return false;
+    SDL_ReadIO(io, magic, 4);
+    SDL_CloseIO(io);
+    return std::memcmp(magic, "GIF8", 4) == 0;
+}
+
+bool loadGif(const std::string& path)
+{
+    size_t len = 0;
+    void* file = SDL_LoadFile(path.c_str(), &len);
+    if (!file) return false;
+    int* delays = nullptr;
+    int w, h, frames, n;
+    unsigned char* rgba = stbi_load_gif_from_memory((const stbi_uc*)file, (int)len,
+        &delays, &w, &h, &frames, &n, 4);
+    SDL_free(file);
+    if (!rgba) return false;
+
+    stopVideo();
+    g_gifPixels.assign(rgba, rgba + (size_t)w * h * 4 * frames);
+    g_gifStart.clear();
+    double t = 0;
+    for (int i = 0; i < frames; ++i)
+    {
+        g_gifStart.push_back(t);
+        int ms = delays ? delays[i] : 0;
+        t += (ms <= 10 ? 100 : ms) / 1000.0; // browsers also play 0-10 ms delays at 100 ms
+    }
+    stbi_image_free(rgba);
+    stbi_image_free(delays);
+
+    startMedia(frames > 1 ? M_GIF : M_IMAGE, t);
+    createPreview(w, h, SDL_TEXTUREACCESS_STREAMING);
+    showFrame(g_gifPixels.data());
+    g_frameShown = 0;
+    return true;
+}
+
+bool loadVideo(const std::string& path)
+{
+    Video probed;
+    double duration;
+    if (!probeVideo(path, probed, duration)) return false;
+
+    stopVideo();
+    Video& v = g_video;
+    v.path = probed.path;
+    v.w = probed.w;
+    v.h = probed.h;
+    v.fps = probed.fps;
+    v.rate = probed.rate;
+    startMedia(M_VIDEO, duration);
+    createPreview(v.w, v.h, SDL_TEXTUREACCESS_STREAMING);
+    g_videoFrame.assign((size_t)v.w * v.h * 4, 0);
+    return startVideo(0);
+}
+
+void openFile(const std::string& path)
+{
+    bool ok;
+    if (isGif(path)) ok = loadGif(path);
+    else if (int w, h, n; stbi_info(path.c_str(), &w, &h, &n)) ok = loadImage(path);
+    else ok = loadVideo(path);
+
+    if (!ok)
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error",
+            "Could not open the file.\nVideos need ffmpeg and ffprobe installed (on PATH).", g_window);
+}
+
+// Move the playback clock and convert the frame it lands on, once per loop
+void updatePlayback()
+{
+    static Uint64 last = SDL_GetTicksNS();
+    Uint64 now = SDL_GetTicksNS();
+    double dt = (double)(now - last) / 1e9;
+    last = now;
+
+    if (g_kind == M_GIF)
+    {
+        if (g_playing) g_time = std::fmod(g_time + dt, g_duration);
+        int f = (int)(std::upper_bound(g_gifStart.begin(), g_gifStart.end(), g_time) - g_gifStart.begin()) - 1;
+        f = std::clamp(f, 0, (int)g_gifStart.size() - 1);
+        if (f != g_frameShown)
+        {
+            showFrame(&g_gifPixels[(size_t)f * g_mediaW * g_mediaH * 4]);
+            g_frameShown = f;
+        }
+    }
+    else if (g_kind == M_VIDEO && g_video.proc)
+    {
+        Video& v = g_video;
+        if (g_playing) g_time += dt;
+
+        bool fresh = false, ended = false, empty = false;
+        {
+            std::lock_guard<std::mutex> lock(v.m);
+            v.wanted = std::max(v.first, (int)(g_time * v.fps));
+            if (v.frameIdx >= 0 && v.frameIdx != g_frameShown)
+            {
+                v.frame.swap(g_videoFrame);
+                g_frameShown = v.frameIdx;
+                fresh = true;
+            }
+            // Ended once the clock is past the last frame ffmpeg sent
+            ended = v.eof && v.frameIdx == g_frameShown && g_time * v.fps >= v.frameIdx + 1;
+            empty = v.eof && v.frameIdx < 0;
+        }
+        v.cv.notify_all();
+
+        if (fresh) showFrame(g_videoFrame.data());
+        if (ended || empty)
+        {
+            if (empty && v.first == 0) g_playing = false; // ffmpeg could not decode anything
+            else if (g_playing)
+            {
+                g_time = 0;
+                startVideo(0); // loop
+            }
+            else
+            {
+                g_time = std::min(g_time, (double)(v.frameIdx + 1) / v.fps);
+            }
+        }
+    }
 }
 
 void copyToClipboard()
@@ -418,7 +791,7 @@ void paintAscii(ImFont* font)
     if (g_lines.empty())
     {
         dl->AddText(ImVec2(p.x + 20, p.y + 20), IM_COL32(160, 160, 160, 255),
-            "Click \"Open image...\" or drop an image here to start");
+            "Click \"Open file...\" or drop an image, GIF or video here to start");
         return;
     }
 
@@ -470,12 +843,37 @@ void drawUi(float dpi, ImFont* font)
     // Left panel: buttons, sliders, preview
     ImGui::BeginChild("panel", ImVec2(PANEL_W * dpi, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
     float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
-    if (ImGui::Button("Open image...", ImVec2(half, 0)))
+    if (ImGui::Button("Open file...", ImVec2(half, 0)))
         PickImageFile();
     ImGui::SameLine();
     if (ImGui::Button("Copy text", ImVec2(half, 0)))
         copyToClipboard();
     ImGui::Spacing();
+
+    if (g_kind == M_GIF || g_kind == M_VIDEO)
+    {
+        if (ImGui::Button(g_playing ? "Pause" : "Play", ImVec2(half, 0)))
+            g_playing = !g_playing;
+        ImGui::SameLine();
+        int t = (int)g_time, d = (int)g_duration;
+        ImGui::Text("%d:%02d / %d:%02d", t / 60, t % 60, d / 60, d % 60);
+
+        // Seek. A GIF follows the slider live; a video restarts ffmpeg when it is let go.
+        static bool wasPlaying = false;
+        float pos = (float)std::min(g_time, g_duration);
+        ImGui::BeginDisabled(g_duration <= 0);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##seek", &pos, 0.0f, (float)g_duration, "");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemActivated()) { wasPlaying = g_playing; g_playing = false; }
+        if (ImGui::IsItemActive()) g_time = pos;
+        if (ImGui::IsItemDeactivated())
+        {
+            if (g_kind == M_VIDEO) startVideo(g_time);
+            g_playing = wasPlaying;
+        }
+        ImGui::Spacing();
+    }
 
     bool changed = false;
     for (int i = 0; i < P_COUNT; ++i)
@@ -546,20 +944,22 @@ int main(int argc, char** argv)
 
     for (Param& p : P) p.pos = p.init;
     onParamsChanged(); // builds glyphs
-    if (argc > 1) loadImage(argv[1]);
+    if (argc > 1) openFile(argv[1]);
 
     bool done = false;
     while (!done)
     {
-        // Sleep until something happens; the timeout picks up file dialog results
+        // Sleep until something happens; the timeout picks up file dialog results.
+        // While playing, don't sleep: vsync paces the loop.
+        bool minimized = SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED;
         SDL_Event e;
-        if (SDL_WaitEventTimeout(&e, 100))
+        if (SDL_WaitEventTimeout(&e, g_playing && !minimized ? 0 : 100))
         {
             do
             {
                 ImGui_ImplSDL3_ProcessEvent(&e);
                 if (e.type == SDL_EVENT_QUIT) done = true;
-                if (e.type == SDL_EVENT_DROP_FILE) loadImage(e.drop.data);
+                if (e.type == SDL_EVENT_DROP_FILE) openFile(e.drop.data);
             } while (SDL_PollEvent(&e));
         }
 
@@ -568,9 +968,11 @@ int main(int argc, char** argv)
             std::lock_guard<std::mutex> lock(g_pickedMutex);
             picked.swap(g_picked);
         }
-        if (!picked.empty()) loadImage(picked);
+        if (!picked.empty()) openFile(picked);
 
         if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) continue;
+
+        updatePlayback();
 
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -585,6 +987,7 @@ int main(int argc, char** argv)
         SDL_RenderPresent(g_renderer);
     }
 
+    stopVideo();
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

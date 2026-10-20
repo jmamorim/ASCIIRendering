@@ -1,6 +1,7 @@
 # ASCIIRendering
 
-Open an image, then drag the sliders to see the ASCII output change live.
+Open an image, GIF or video, then drag the sliders to see the ASCII output
+change live.
 Runs on Windows, macOS and Linux (SDL3 + Dear ImGui).
 
 The build needs CMake 3.24+, a C++20 compiler and internet access the first
@@ -72,16 +73,31 @@ Windows 10/11 machine without extra DLLs.
        ./build/ASCIIRendering
        ./build/ASCIIRendering ~/Pictures/image.png
 
-The **Open image...** button uses the desktop's file chooser (the XDG portal,
+The **Open file...** button uses the desktop's file chooser (the XDG portal,
 or `zenity` as a fallback). If neither is installed, pass the image on the
 command line or drop it on the window instead.
 
+## Videos
+
+GIFs work out of the box. Videos (mp4, mkv, webm, mov, ...) are decoded by
+the `ffmpeg` and `ffprobe` programs, which must be on PATH when you open one:
+
+    # Windows
+    winget install Gyan.FFmpeg
+    # macOS
+    brew install ffmpeg
+    # Arch / Debian / Fedora
+    sudo pacman -S ffmpeg / sudo apt install ffmpeg / sudo dnf install ffmpeg
+
 ## Using it
 
-- Open an image with **Open image...**, by dropping it on the window, or by
-  passing its path when starting the program.
+- Open an image, GIF or video with **Open file...**, by dropping it on the
+  window, or by passing its path when starting the program.
+- GIFs and videos play in a loop at their real speed; when converting a frame
+  takes longer than the frame lasts, frames are skipped. **Pause**/**Play**
+  and the slider under it pause and seek.
 - Drag the sliders; the ASCII output on the right updates as you go.
-- **Copy text** puts the ASCII output on the clipboard.
+- **Copy text** puts the ASCII output (the current frame) on the clipboard.
 
 The glyphs are matched against DejaVu Sans Mono, which is compiled into the
 program (`assets/`, see `assets/DejaVu-LICENSE.txt`).

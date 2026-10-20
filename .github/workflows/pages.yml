@@ -1,0 +1,52 @@
+# Builds the WebAssembly version and publishes it on GitHub Pages.
+# One-time setup: repo Settings > Pages > Build and deployment > Source: GitHub Actions.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.13
+
+      - name: Build
+        run: |
+          emcmake cmake -S . -B build-web -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-web
+
+      - name: Collect site files
+        run: |
+          mkdir site
+          cp build-web/index.html build-web/index.js build-web/index.wasm site/
+          cp assets/DejaVu-LICENSE.txt site/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

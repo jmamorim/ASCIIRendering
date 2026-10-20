@@ -1,8 +1,9 @@
-// Build (Windows, macOS, Linux): see README.md
+// Build (Windows, macOS, Linux, web): see README.md
 //   cmake -S . -B build && cmake --build build
 //
 // Open an image, GIF or video, then drag the sliders to see the ASCII output
-// change live. Videos are decoded by the ffmpeg program, which must be on PATH.
+// change live. Videos are decoded by the ffmpeg program, which must be on PATH;
+// in the browser build (__EMSCRIPTEN__) the browser decodes them instead.
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -20,15 +21,20 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#else
+#include <atomic>
+#include <condition_variable>
+#include <thread>
+#endif
 
 // ---------------------------------------------------------------------------
 // Basic types
@@ -113,6 +119,30 @@ stbtt_fontinfo g_font;               // glyph font for the shape vectors
 std::mutex g_pickedMutex;
 std::string g_picked;
 
+#ifdef __EMSCRIPTEN__
+// Browser: an <input type="file"> copies the file into Emscripten's in-memory
+// file system, then webFilePicked hands its path to the main loop.
+EM_JS(void, PickImageFile, (), {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*,video/*';
+    input.onchange = async () => {
+        const file = input.files[0];
+        if (!file) return;
+        const data = new Uint8Array(await file.arrayBuffer());
+        try { FS.mkdir('/picked'); } catch (e) {}
+        FS.writeFile('/picked/file', data, { canOwn: true });
+        _webFilePicked();
+    };
+    input.click();
+});
+
+extern "C" EMSCRIPTEN_KEEPALIVE void webFilePicked()
+{
+    std::lock_guard<std::mutex> lock(g_pickedMutex);
+    g_picked = "/picked/file";
+}
+#else
 void SDLCALL onFilePicked(void*, const char* const* files, int)
 {
     if (!files || !files[0]) return; // error or cancelled
@@ -128,6 +158,7 @@ void PickImageFile()
     };
     SDL_ShowOpenFileDialog(onFilePicked, nullptr, g_window, filters, 2, nullptr, false);
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // RGBA pixels -> grayscale buffer
@@ -437,6 +468,162 @@ int g_frameShown = -1;  // index of the frame in g_gray / g_lines
 std::vector<unsigned char> g_gifPixels; // RGBA, frame after frame
 std::vector<double> g_gifStart;         // start time of each frame, seconds
 
+std::vector<unsigned char> g_videoFrame; // the video frame the main thread is converting
+
+void createPreview(int w, int h, SDL_TextureAccess access)
+{
+    SDL_DestroyTexture(g_image);
+    g_image = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, access, w, h);
+    g_mediaW = w;
+    g_mediaH = h;
+}
+
+void showFrame(const unsigned char* rgba)
+{
+    if (g_image) SDL_UpdateTexture(g_image, nullptr, rgba, g_mediaW * 4);
+    g_gray = toGray(rgba, g_mediaW, g_mediaH);
+    renderAscii();
+}
+
+void startMedia(MediaKind kind, double duration)
+{
+    g_kind = kind;
+    g_duration = duration;
+    g_time = 0;
+    g_playing = kind == M_GIF || kind == M_VIDEO;
+    g_frameShown = -1;
+    g_gray = Gray();
+    g_lines.clear();
+}
+
+#ifdef __EMSCRIPTEN__
+// Video in the browser: a hidden <video> element decodes and plays it (looping).
+// Once per loop the frame it is showing is drawn to a canvas and its pixels are
+// copied here, so when converting is slower than the video, frames are skipped.
+// Opening is asynchronous: webVideoReady or webVideoFailed is called later.
+const char* OPEN_ERROR = "Could not open the file.\nThis browser can't play this video format.";
+
+struct Video
+{
+    bool open = false; // a video is loaded and playing in the <video> element
+    int w = 0, h = 0;
+};
+Video g_video;
+
+EM_JS(void, jsVideoClose, (), {
+    const v = Module.asciiVideo;
+    if (!v) return;
+    Module.asciiVideo = null;
+    v.closed = true;
+    v.onloadeddata = v.onerror = v.onseeked = null;
+    v.pause();
+    URL.revokeObjectURL(v.src);
+    v.removeAttribute('src');
+    v.load();
+});
+
+EM_JS(void, jsVideoOpen, (const char* path), {
+    const v = document.createElement('video');
+    v.muted = true;
+    v.loop = true;
+    v.playsInline = true;
+    v.src = URL.createObjectURL(new Blob([FS.readFile(UTF8ToString(path))]));
+    v.fresh = true; // a frame we have not copied yet is on screen
+    v.onloadeddata = () => {
+        v.onloadeddata = null;
+        _webVideoReady(v.videoWidth, v.videoHeight, isFinite(v.duration) ? v.duration : 0);
+    };
+    v.onerror = () => {
+        if (Module.asciiVideo == v) _webVideoFailed();
+    };
+    v.onseeked = () => { v.fresh = true; };
+    if (v.requestVideoFrameCallback) {
+        const onFrame = () => {
+            if (v.closed) return;
+            v.fresh = true;
+            v.requestVideoFrameCallback(onFrame);
+        };
+        v.requestVideoFrameCallback(onFrame);
+    }
+    Module.asciiVideo = v;
+});
+
+EM_JS(double, jsVideoTime, (), {
+    const v = Module.asciiVideo;
+    return v ? v.currentTime : 0;
+});
+
+EM_JS(void, jsVideoSeek, (double t), {
+    const v = Module.asciiVideo;
+    if (v) v.currentTime = t;
+});
+
+// Plays or pauses the video, then copies the frame on screen to `dst` (w x h RGBA)
+// if it changed since the last call. Returns 1 when it did.
+EM_JS(int, jsVideoUpdate, (int playing, unsigned char* dst, int w, int h), {
+    const v = Module.asciiVideo;
+    if (!v || v.readyState < 2) return 0;
+    if (playing && v.paused) v.play().catch(() => {});
+    if (!playing && !v.paused) v.pause();
+    // Without requestVideoFrameCallback, a moved clock means a new frame
+    if (!v.requestVideoFrameCallback && v.currentTime != v.lastTime) v.fresh = true;
+    v.lastTime = v.currentTime;
+    if (!v.fresh) return 0;
+    v.fresh = false;
+
+    let c = Module.asciiCanvas;
+    if (!c) {
+        c = Module.asciiCanvas = document.createElement('canvas');
+        c.ctx = c.getContext('2d', { willReadFrequently: true });
+    }
+    if (c.width != w || c.height != h) {
+        c.width = w;
+        c.height = h;
+    }
+    c.ctx.drawImage(v, 0, 0, w, h);
+    HEAPU8.set(c.ctx.getImageData(0, 0, w, h).data, dst);
+    return 1;
+});
+
+void stopVideo()
+{
+    jsVideoClose();
+    g_video.open = false;
+}
+
+// Seek to `t` seconds
+bool startVideo(double t)
+{
+    jsVideoSeek(t);
+    return true;
+}
+
+bool loadVideo(const std::string& path)
+{
+    stopVideo();
+    jsVideoOpen(path.c_str());
+    return true;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void webVideoReady(int w, int h, double duration)
+{
+    Video& v = g_video;
+    v.open = true;
+    v.w = w;
+    v.h = h;
+    startMedia(M_VIDEO, duration);
+    createPreview(w, h, SDL_TEXTUREACCESS_STREAMING);
+    g_videoFrame.assign((size_t)w * h * 4, 0);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void webVideoFailed()
+{
+    stopVideo();
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", OPEN_ERROR, g_window);
+}
+#else
+const char* OPEN_ERROR = "Could not open the file.\nVideos need ffmpeg and ffprobe installed (on PATH).";
+
 // Video: the ffmpeg program decodes it and writes raw RGBA frames to a pipe.
 // A reader thread holds back each frame until the playback clock reaches it,
 // so when converting is slower than the video, frames are skipped.
@@ -458,22 +645,6 @@ struct Video
     std::atomic<bool> stop{ false };
 };
 Video g_video;
-std::vector<unsigned char> g_videoFrame; // the frame the main thread is converting
-
-void createPreview(int w, int h, SDL_TextureAccess access)
-{
-    SDL_DestroyTexture(g_image);
-    g_image = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, access, w, h);
-    g_mediaW = w;
-    g_mediaH = h;
-}
-
-void showFrame(const unsigned char* rgba)
-{
-    if (g_image) SDL_UpdateTexture(g_image, nullptr, rgba, g_mediaW * 4);
-    g_gray = toGray(rgba, g_mediaW, g_mediaH);
-    renderAscii();
-}
 
 void videoReader()
 {
@@ -610,16 +781,25 @@ bool probeVideo(const std::string& path, Video& v, double& duration)
     return true;
 }
 
-void startMedia(MediaKind kind, double duration)
+bool loadVideo(const std::string& path)
 {
-    g_kind = kind;
-    g_duration = duration;
-    g_time = 0;
-    g_playing = kind == M_GIF || kind == M_VIDEO;
-    g_frameShown = -1;
-    g_gray = Gray();
-    g_lines.clear();
+    Video probed;
+    double duration;
+    if (!probeVideo(path, probed, duration)) return false;
+
+    stopVideo();
+    Video& v = g_video;
+    v.path = probed.path;
+    v.w = probed.w;
+    v.h = probed.h;
+    v.fps = probed.fps;
+    v.rate = probed.rate;
+    startMedia(M_VIDEO, duration);
+    createPreview(v.w, v.h, SDL_TEXTUREACCESS_STREAMING);
+    g_videoFrame.assign((size_t)v.w * v.h * 4, 0);
+    return startVideo(0);
 }
+#endif
 
 bool loadImage(const std::string& path)
 {
@@ -677,25 +857,6 @@ bool loadGif(const std::string& path)
     return true;
 }
 
-bool loadVideo(const std::string& path)
-{
-    Video probed;
-    double duration;
-    if (!probeVideo(path, probed, duration)) return false;
-
-    stopVideo();
-    Video& v = g_video;
-    v.path = probed.path;
-    v.w = probed.w;
-    v.h = probed.h;
-    v.fps = probed.fps;
-    v.rate = probed.rate;
-    startMedia(M_VIDEO, duration);
-    createPreview(v.w, v.h, SDL_TEXTUREACCESS_STREAMING);
-    g_videoFrame.assign((size_t)v.w * v.h * 4, 0);
-    return startVideo(0);
-}
-
 void openFile(const std::string& path)
 {
     bool ok;
@@ -703,9 +864,13 @@ void openFile(const std::string& path)
     else if (int w, h, n; stbi_info(path.c_str(), &w, &h, &n)) ok = loadImage(path);
     else ok = loadVideo(path);
 
+#ifdef __EMSCRIPTEN__
+    // The file was copied into memory for us and has been read now, so free it
+    std::remove(path.c_str());
+#endif
+
     if (!ok)
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error",
-            "Could not open the file.\nVideos need ffmpeg and ffprobe installed (on PATH).", g_window);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", OPEN_ERROR, g_window);
 }
 
 // Move the playback clock and convert the frame it lands on, once per loop
@@ -727,6 +892,15 @@ void updatePlayback()
             g_frameShown = f;
         }
     }
+#ifdef __EMSCRIPTEN__
+    else if (g_kind == M_VIDEO && g_video.open)
+    {
+        // The browser keeps the clock; convert the frame it is showing now
+        Video& v = g_video;
+        if (g_playing) g_time = jsVideoTime();
+        if (jsVideoUpdate(g_playing, g_videoFrame.data(), v.w, v.h)) showFrame(g_videoFrame.data());
+    }
+#else
     else if (g_kind == M_VIDEO && g_video.proc)
     {
         Video& v = g_video;
@@ -763,7 +937,20 @@ void updatePlayback()
             }
         }
     }
+#endif
 }
+
+#ifdef __EMSCRIPTEN__
+// SDL keeps its clipboard to itself in the browser, so use the page's
+EM_JS(void, setClipboardText, (const char* text), {
+    navigator.clipboard.writeText(UTF8ToString(text)).catch(() => {});
+});
+#else
+void setClipboardText(const char* text)
+{
+    SDL_SetClipboardText(text);
+}
+#endif
 
 void copyToClipboard()
 {
@@ -771,7 +958,7 @@ void copyToClipboard()
 
     std::string text;
     for (const std::string& l : g_lines) { text += l; text += "\n"; }
-    SDL_SetClipboardText(text.c_str());
+    setClipboardText(text.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -858,7 +1045,7 @@ void drawUi(float dpi, ImFont* font)
         int t = (int)g_time, d = (int)g_duration;
         ImGui::Text("%d:%02d / %d:%02d", t / 60, t % 60, d / 60, d % 60);
 
-        // Seek. A GIF follows the slider live; a video restarts ffmpeg when it is let go.
+        // Seek. A GIF follows the slider live; a video seeks (restarts ffmpeg) when it is let go.
         static bool wasPlaying = false;
         float pos = (float)std::min(g_time, g_duration);
         ImGui::BeginDisabled(g_duration <= 0);
@@ -901,6 +1088,58 @@ void drawUi(float dpi, ImFont* font)
 }
 
 // ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+float g_dpi = 1;
+ImFont* g_uiFont = nullptr;
+bool g_done = false;
+
+void handleEvent(const SDL_Event& e)
+{
+    ImGui_ImplSDL3_ProcessEvent(&e);
+    if (e.type == SDL_EVENT_QUIT) g_done = true;
+    if (e.type == SDL_EVENT_DROP_FILE) openFile(e.drop.data);
+}
+
+// Everything after the events: open a picked file, advance playback, draw
+void runFrame()
+{
+    std::string picked;
+    {
+        std::lock_guard<std::mutex> lock(g_pickedMutex);
+        picked.swap(g_picked);
+    }
+    if (!picked.empty()) openFile(picked);
+
+    if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) return;
+
+    updatePlayback();
+
+    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    drawUi(g_dpi, g_uiFont);
+    ImGui::Render();
+
+    ImGuiIO& io = ImGui::GetIO();
+    SDL_SetRenderScale(g_renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
+    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+    SDL_RenderClear(g_renderer);
+    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_renderer);
+    SDL_RenderPresent(g_renderer);
+}
+
+#ifdef __EMSCRIPTEN__
+// The browser calls this once per display frame. It must return, or the page freezes.
+void webFrame()
+{
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) handleEvent(e);
+    runFrame();
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv)
@@ -913,15 +1152,21 @@ int main(int argc, char** argv)
 
     float dpi = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (dpi <= 0) dpi = 1;
-    g_window = SDL_CreateWindow("ASCII renderer", (int)(1200 * dpi), (int)(800 * dpi),
-        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    g_dpi = dpi;
+    SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#ifdef __EMSCRIPTEN__
+    flags |= SDL_WINDOW_FILL_DOCUMENT; // the canvas follows the browser window's size
+#endif
+    g_window = SDL_CreateWindow("ASCII renderer", (int)(1200 * dpi), (int)(800 * dpi), flags);
     g_renderer = g_window ? SDL_CreateRenderer(g_window, nullptr) : nullptr;
     if (!g_renderer)
     {
         SDL_Log("Could not create the window: %s", SDL_GetError());
         return 1;
     }
-    SDL_SetRenderVSync(g_renderer, 1);
+#ifndef __EMSCRIPTEN__
+    SDL_SetRenderVSync(g_renderer, 1); // the browser already paces frames to the display
+#endif
 
     stbtt_InitFont(&g_font, font_data, stbtt_GetFontOffsetForIndex(font_data, 0));
 
@@ -937,7 +1182,7 @@ int main(int argc, char** argv)
     // Same font for the UI and the ASCII output
     ImFontConfig cfg;
     cfg.FontDataOwnedByAtlas = false;
-    ImFont* font = io.Fonts->AddFontFromMemoryTTF((void*)font_data, (int)sizeof(font_data), 15.0f, &cfg);
+    g_uiFont = io.Fonts->AddFontFromMemoryTTF((void*)font_data, (int)sizeof(font_data), 15.0f, &cfg);
 
     ImGui_ImplSDL3_InitForSDLRenderer(g_window, g_renderer);
     ImGui_ImplSDLRenderer3_Init(g_renderer);
@@ -946,8 +1191,12 @@ int main(int argc, char** argv)
     onParamsChanged(); // builds glyphs
     if (argc > 1) openFile(argv[1]);
 
-    bool done = false;
-    while (!done)
+#ifdef __EMSCRIPTEN__
+    // Hand the loop to the browser; the program keeps running after main returns
+    emscripten_set_main_loop(webFrame, 0, false);
+    return 0;
+#else
+    while (!g_done)
     {
         // Sleep until something happens; the timeout picks up file dialog results.
         // While playing, don't sleep: vsync paces the loop.
@@ -955,36 +1204,10 @@ int main(int argc, char** argv)
         SDL_Event e;
         if (SDL_WaitEventTimeout(&e, g_playing && !minimized ? 0 : 100))
         {
-            do
-            {
-                ImGui_ImplSDL3_ProcessEvent(&e);
-                if (e.type == SDL_EVENT_QUIT) done = true;
-                if (e.type == SDL_EVENT_DROP_FILE) openFile(e.drop.data);
-            } while (SDL_PollEvent(&e));
+            do handleEvent(e);
+            while (SDL_PollEvent(&e));
         }
-
-        std::string picked;
-        {
-            std::lock_guard<std::mutex> lock(g_pickedMutex);
-            picked.swap(g_picked);
-        }
-        if (!picked.empty()) openFile(picked);
-
-        if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) continue;
-
-        updatePlayback();
-
-        ImGui_ImplSDLRenderer3_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();
-        drawUi(dpi, font);
-        ImGui::Render();
-
-        SDL_SetRenderScale(g_renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
-        SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
-        SDL_RenderClear(g_renderer);
-        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_renderer);
-        SDL_RenderPresent(g_renderer);
+        runFrame();
     }
 
     stopVideo();
@@ -996,4 +1219,5 @@ int main(int argc, char** argv)
     SDL_DestroyWindow(g_window);
     SDL_Quit();
     return 0;
+#endif
 }

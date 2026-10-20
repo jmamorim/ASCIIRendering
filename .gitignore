@@ -363,4 +363,5 @@ MigrationBackup/
 FodyWeavers.xsd
 # CMake build output
 build/
+build-web/
 out/

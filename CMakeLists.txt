@@ -54,3 +54,14 @@ target_link_libraries(ASCIIRendering PRIVATE imgui SDL3::SDL3)
 if(MSVC)
     target_compile_options(ASCIIRendering PRIVATE /utf-8)
 endif()
+
+# Web build (emcmake cmake ...): index.html + index.js + index.wasm
+if(EMSCRIPTEN)
+    set_target_properties(ASCIIRendering PROPERTIES OUTPUT_NAME index SUFFIX .html)
+    target_link_options(ASCIIRendering PRIVATE
+        -sALLOW_MEMORY_GROWTH=1
+        -sMAXIMUM_MEMORY=4GB
+        -sMINIFY_HTML=0
+        --shell-file ${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html)
+    set_property(TARGET ASCIIRendering APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html)
+endif()

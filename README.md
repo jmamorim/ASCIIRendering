@@ -2,7 +2,8 @@
 
 Open an image, GIF or video, then drag the sliders to see the ASCII output
 change live.
-Runs on Windows, macOS and Linux (SDL3 + Dear ImGui).
+Runs on Windows, macOS, Linux and in the browser (SDL3 + Dear ImGui, compiled
+to WebAssembly for the web).
 
 The build needs CMake 3.24+, a C++20 compiler and internet access the first
 time: Dear ImGui, stb and (when it isn't installed) SDL3 are downloaded while
@@ -77,10 +78,31 @@ The **Open file...** button uses the desktop's file chooser (the XDG portal,
 or `zenity` as a fallback). If neither is installed, pass the image on the
 command line or drop it on the window instead.
 
+## Web (WebAssembly)
+
+Every push to `master` builds the web version and publishes it on GitHub
+Pages (`.github/workflows/pages.yml`). Turn this on once under the repo's
+**Settings > Pages > Build and deployment > Source: GitHub Actions**.
+
+To build it yourself, install [Emscripten](https://emscripten.org/docs/getting_started/downloads.html)
+and Ninja, then:
+
+    emcmake cmake -S . -B build-web -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-web
+
+This makes `index.html`, `index.js` and `index.wasm` in `build-web`. Browsers
+won't load WebAssembly from a `file://` page, so serve the folder:
+
+    python -m http.server -d build-web 8000
+
+and open <http://localhost:8000>. In the browser, videos are decoded by the
+browser itself (no ffmpeg needed), so the formats depend on the browser: mp4
+and webm work everywhere. Files never leave your computer.
+
 ## Videos
 
-GIFs work out of the box. Videos (mp4, mkv, webm, mov, ...) are decoded by
-the `ffmpeg` and `ffprobe` programs, which must be on PATH when you open one:
+GIFs work out of the box. In the desktop version, videos (mp4, mkv, webm,
+mov, ...) are decoded by the `ffmpeg` and `ffprobe` programs, which must be on PATH when you open one:
 
     # Windows
     winget install Gyan.FFmpeg

@@ -160,6 +160,75 @@ void PickImageFile()
 }
 #endif
 
+struct KdNode
+{
+    int glyph;   // index in g_glyphs
+    int axis;    // which circle this node splits on
+    int left = -1; int right = -1;
+};
+
+std::vector<KdNode> g_kd;
+int g_KdRoot = -1;
+
+// Build: sort the glyphs on one circle, the median becomes the node,
+// smaller ones go left, bigger ones right. Next level uses the next circle.
+int buildKd(std::vector<int>& idx, int lo, int hi, int depth)
+{
+    if(lo >= hi) return -1;
+    int axis = depth % N;
+    int mid = (lo + hi) / 2;
+    std::nth_element(idx.begin() + lo, idx.begin() + mid, idx.begin() + hi,
+        [&] (int a, int b) {return g_glyphs[a].v[axis] < g_glyphs[b].v[axis];});
+    int me = (int)g_kd.size();
+    g_kd.push_back({ idx[mid], axis });
+    int l = buildKd(idx, lo, mid, depth + 1);
+    int r = buildKd(idx, mid + 1, hi, depth + 1);
+    g_kd[me].left = l;
+    g_kd[me].right = r;
+    return me;
+}
+// ---------------------------------------------------------------------------
+// Kd Tree 
+// ---------------------------------------------------------------------------
+
+// Search: go down the side the cell is on, then only visit the other side
+// if the dividing line is closer than the best glyph found so far.
+void KdNearest(int n, const Vec& in, int& best, float& bestDist)
+{
+    if(n < 0) return;
+    const KdNode& node = g_kd[n];
+    const Vec& p = g_glyphs[node.glyph].v;
+
+    float d = 0.0f;
+    for (int i = 0; i < N; i++)
+    {
+        float diff = p[i] - in[i];
+        d += diff * diff;
+    }
+    if (d < bestDist)
+    {
+        bestDist = d;
+        best = node.glyph;
+    }
+
+    //which side of the line is the cell on?
+    float diff = in[node.axis] - p[node.axis];
+    int nearSide = diff < 0 ? node.left : node.right;
+    int farSide = diff < 0 ? node.right : node.left;
+
+    KdNearest(nearSide, in, best, bestDist);
+    if(diff * diff < bestDist)     // line closer than best : other side might win
+        KdNearest(farSide, in, best, bestDist);
+}
+
+char findBestCharKd(const Vec& in)
+{
+    int best = 0;
+    float bestDist = 1e30f;
+    KdNearest(g_KdRoot, in, best, bestDist);
+    return g_glyphs[best].ch;
+}
+
 // ---------------------------------------------------------------------------
 // RGBA pixels -> grayscale buffer
 // ---------------------------------------------------------------------------
@@ -363,44 +432,6 @@ void enhanceDirectional(Vec& v, const ExtVec& ext, float exponent)
 }
 
 // ---------------------------------------------------------------------------
-// Nearest neighbor lookup.
-//
-// `in` is the 6 numbers measured for one image cell (the sampling vector).
-// Each glyph has its own 6 numbers (its shape vector). We want the glyph
-// whose 6 numbers are closest to `in`, i.e. whose shape looks most like
-// the cell.
-//
-// "Closest" = smallest distance between the two 6-number lists, like the
-// distance between two points, just with 6 coordinates instead of 2:
-//     distance = sqrt( (a0-b0)^2 + (a1-b1)^2 + ... + (a5-b5)^2 )
-// We skip the sqrt: if one squared distance is smaller than another, so is
-// its square root, so the winner is the same and we save the work.
-//
-// Brute force: checks all 95 glyphs for every cell. Fine for a still image.
-// ---------------------------------------------------------------------------
-char findBestChar(const std::vector<Glyph>& glyphs, const Vec& in)
-{
-    char best = ' ';        // winner so far (any default, it gets replaced)
-    float bestDist = 1e30f; // smallest distance so far; starts huge so the first glyph always beats it
-
-    for (const Glyph& gl : glyphs)
-    {
-        float d = 0.0f;
-        for (int i = 0; i < N; ++i)
-        {
-            float diff = gl.v[i] - in[i];
-            d += diff * diff;
-        }
-        if (d < bestDist)
-        {
-            bestDist = d;
-            best = gl.ch;
-        }
-    }
-    return best;
-}
-
-// ---------------------------------------------------------------------------
 // Image -> lines of ASCII, using the current slider values
 // ---------------------------------------------------------------------------
 void renderAscii()
@@ -428,7 +459,7 @@ void renderAscii()
                 enhanceDirectional(v, ext, exponent);
                 enhanceContrast(v, exponent);
             }
-            line += findBestChar(g_glyphs, v);
+            line += findBestCharKd(v);
         }
         g_lines.push_back(line);
     }
@@ -446,6 +477,10 @@ void onParamsChanged()
     {
         layoutCircles(r, s);
         g_glyphs = buildGlyphs(f);
+        std::vector<int> idx(g_glyphs.size());
+        for (int i = 0; i < (int)idx.size(); i++) idx[i] = i;
+        g_kd.clear();
+        g_KdRoot = buildKd(idx, 0, (int)idx.size(), 0);
         lr = r; ls = s; lf = f;
     }
 

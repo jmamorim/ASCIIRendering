@@ -179,7 +179,11 @@ Gray toGray(const unsigned char* rgba, int w, int h)
             float r = row[x * 4 + 0];
             float gg = row[x * 4 + 1];
             float b = row[x * 4 + 2];
-            g.px[(size_t)y * w + x] = (0.2126f * r + 0.7152f * gg + 0.0722f * b) / 255.0f;
+            float a = row[x * 4 + 3];
+            if(a == 0)
+                g.px[(size_t)y * w + x] = 0;
+            else
+                g.px[(size_t)y * w + x] = (0.2126f * r + 0.7152f * gg + 0.0722f * b) / 255.0f * (a / 255.0f);
         }
     }
     return g;

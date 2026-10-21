@@ -1,5 +1,9 @@
 # ASCIIRendering
 
+This project its an experiment that was inspire by Alex Harri blog "ASCII characters are not pixels: a deep dive into ASCII rendering" it was a good starting point for me to learn about ASCII rendering of images and even how to use web assembly to deploy on github pages the project. Its still work in progress.
+
+## Instructions
+
 Open an image, GIF or video, then drag the sliders to see the ASCII output
 change live.
 Runs on Windows, macOS, Linux and in the browser (SDL3 + Dear ImGui, compiled

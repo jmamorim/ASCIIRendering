@@ -1,6 +1,6 @@
 # ASCIIRendering
 
-This project is an experiment that was inspire by Alex Harri blog "ASCII characters are not pixels: a deep dive into ASCII rendering" it was a good starting point for me to learn about ASCII rendering of images and even how to use web assembly to deploy on github pages the project. Its still work in progress.
+This project is an experiment that was inspire by Alex Harri blog "ASCII characters are not pixels: a deep dive into ASCII rendering" (https://alexharri.com/blog/ascii-rendering) it was a good starting point for me to learn about ASCII rendering of images and even how to use web assembly to deploy on github pages the project. Its still work in progress.
 
 ## Instructions
 

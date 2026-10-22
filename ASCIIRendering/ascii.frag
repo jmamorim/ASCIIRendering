@@ -65,7 +65,12 @@ float sampleCircle(vec2 origin, vec3 circ)
         }
     }
 
-    return count > 0 ? sum / float(count) : 0.0;
+    if (count > 0) return sum / float(count);
+
+    // Circle was tiny or the step skipped everything: fall back to the center pixel
+    ivec2 p = ivec2(c);
+    if (all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, size))) return gray(p);
+    return 0.0;
 }
 
 

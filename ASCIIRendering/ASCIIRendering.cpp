@@ -9,7 +9,7 @@
 #include <SDL3/SDL_main.h>
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
-#include "imgui_impl_sdlrenderer3.h"
+#include "imgui_impl_opengl3.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_WINDOWS_UTF8 // SDL hands us UTF-8 paths, also on Windows
@@ -18,6 +18,7 @@
 #include "stb_truetype.h"
 
 #include "font_data.h" // DejaVu Sans Mono, embedded at build time (assets/)
+#include "ascii_frag.h" // ascii.frag, embedded at build time
 
 #include <algorithm>
 #include <array>
@@ -30,11 +31,64 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <emscripten/html5.h>
+#include <GLES3/gl3.h>
 #else
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <SDL3/SDL_opengl.h>
 #endif
+
+// ---------------------------------------------------------------------------
+// OpenGL. The browser has every function; on desktop only GL 1.1 is linked,
+// the rest is loaded at runtime.
+// ---------------------------------------------------------------------------
+#ifdef __EMSCRIPTEN__
+const char* GLSL_VERSION = "#version 300 es";
+#else
+const char* GLSL_VERSION = "#version 330 core";
+
+#define GL_FUNCS(X) \
+    X(PFNGLCREATESHADERPROC, glCreateShader) \
+    X(PFNGLSHADERSOURCEPROC, glShaderSource) \
+    X(PFNGLCOMPILESHADERPROC, glCompileShader) \
+    X(PFNGLGETSHADERIVPROC, glGetShaderiv) \
+    X(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog) \
+    X(PFNGLDELETESHADERPROC, glDeleteShader) \
+    X(PFNGLCREATEPROGRAMPROC, glCreateProgram) \
+    X(PFNGLATTACHSHADERPROC, glAttachShader) \
+    X(PFNGLLINKPROGRAMPROC, glLinkProgram) \
+    X(PFNGLGETPROGRAMIVPROC, glGetProgramiv) \
+    X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog) \
+    X(PFNGLUSEPROGRAMPROC, glUseProgram) \
+    X(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation) \
+    X(PFNGLUNIFORM1IPROC, glUniform1i) \
+    X(PFNGLUNIFORM1FPROC, glUniform1f) \
+    X(PFNGLUNIFORM2FPROC, glUniform2f) \
+    X(PFNGLUNIFORM3FVPROC, glUniform3fv) \
+    X(PFNGLGENFRAMEBUFFERSPROC, glGenFramebuffers) \
+    X(PFNGLBINDFRAMEBUFFERPROC, glBindFramebuffer) \
+    X(PFNGLFRAMEBUFFERTEXTURE2DPROC, glFramebufferTexture2D) \
+    X(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus) \
+    X(PFNGLDRAWBUFFERSPROC, glDrawBuffers) \
+    X(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays) \
+    X(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray)
+
+#define X(type, name) static type name;
+GL_FUNCS(X)
+#undef X
+#endif
+
+bool loadGl()
+{
+#ifndef __EMSCRIPTEN__
+#define X(type, name) if (!(name = (type)SDL_GL_GetProcAddress(#name))) return false;
+    GL_FUNCS(X)
+#undef X
+#endif
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Basic types
@@ -42,27 +96,10 @@
 const int N = 6; // sampling circles per cell
 using Vec = std::array<float, N>;
 
-struct Gray
-{
-    int w = 0, h = 0;
-    std::vector<float> px; // lightness 0..1
-};
-
 struct Circle { float cx, cy, r; }; // cx, cy: fraction of cell; r: fraction of cell width
 
 const int ECC = 10; // external circles per cell
-using ExtVec = std::array<float, ECC>;
 Circle g_extCircles[ECC];
-
-// which external circles affect an internal circle
-const std::vector<int> AFFECTING[N] = {
-    {0, 1, 2, 4},
-    {0, 1, 3, 5},
-    {2, 4, 6},
-    {3, 5, 7},
-    {4, 6, 8, 9},
-    {5, 7, 8, 9},
-};
 
 struct Glyph
 {
@@ -104,9 +141,10 @@ float val(int i)
 const float PANEL_W = 300; // before DPI scaling
 
 SDL_Window* g_window = nullptr;
-SDL_Renderer* g_renderer = nullptr;
-SDL_Texture* g_image = nullptr;      // for the preview
-Gray g_gray;                         // grayscale copy for sampling
+SDL_GLContext g_gl = nullptr;
+GLuint g_image = 0;                  // the preview, also the shader's input
+int g_mediaW = 0, g_mediaH = 0;
+bool g_imageReady = false;
 Circle g_circles[N];
 std::vector<Glyph> g_glyphs;
 std::vector<std::string> g_lines;    // current ASCII output
@@ -230,32 +268,6 @@ char findBestCharKd(const Vec& in)
 }
 
 // ---------------------------------------------------------------------------
-// RGBA pixels -> grayscale buffer
-// ---------------------------------------------------------------------------
-Gray toGray(const unsigned char* rgba, int w, int h)
-{
-    Gray g;
-    g.w = w;
-    g.h = h;
-    g.px.resize((size_t)w * h);
-
-    for (int y = 0; y < h; ++y)
-    {
-        const unsigned char* row = rgba + (size_t)y * w * 4;
-        for (int x = 0; x < w; ++x)
-        {
-            // memory order is R, G, B, A
-            float r = row[x * 4 + 0];
-            float gg = row[x * 4 + 1];
-            float b = row[x * 4 + 2];
-            float a = row[x * 4 + 3];
-            g.px[(size_t)y * w + x] = (0.2126f * r + 0.7152f * gg + 0.0722f * b) / 255.0f * (a / 255.0f);
-        }
-    }
-    return g;
-}
-
-// ---------------------------------------------------------------------------
 // The 6 circles. Index order:  0 1
 //                              2 3
 //                              4 5
@@ -291,58 +303,150 @@ void layoutCircles(float radius, float stagger)
 }
 
 
-// Average lightness of the pixels inside one circle.
-// `step` = supersampling knob (1 = every pixel, 2 = every other pixel, ...)
-float sampleCircle(const Gray& g, float ox, float oy, float cw, float ch,
-    const Circle& c, int step)
+// ---------------------------------------------------------------------------
+// GPU pass: ascii.frag runs once per cell into a cols x rows target and
+// writes the cell's 6 circle values; the glyph lookup stays on the CPU.
+// ---------------------------------------------------------------------------
+const char* FULLSCREEN_VS = R"(
+void main()
+{
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+struct AsciiPass
+{
+    GLuint prog = 0, vao = 0, fbo = 0;
+    GLuint out[2] = {};     // circles 0..3, circles 4..5
+    int cols = 0, rows = 0;
+    GLint uImage, uCell, uCircles, uExt, uExponent, uStep;
+    std::vector<float> v0123, v45;
+};
+AsciiPass g_pass;
+
+GLuint compileShader(GLenum type, const char* body, int len)
+{
+    const char* src[] = { GLSL_VERSION, "\n", body };
+    const GLint lens[] = { -1, -1, len };
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 3, src, lens);
+    glCompileShader(s);
+    GLint ok;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok)
     {
-        float cx = ox + c.cx * cw;
-        float cy = oy + c.cy * ch;
-        float r = c.r * cw;
-        
-        int x0 = (int)std::floor(cx - r), x1 = (int)std::ceil(cx + r);
-        int y0 = (int)std::floor(cy - r), y1 = (int)std::ceil(cy + r);
-        
-        float sum = 0.0f;
-        int count = 0;
-        
-        for (int y = y0; y <= y1; y += step)
-        {
-            for (int x = x0; x <= x1; x += step)
-            {
-                if (x < 0 || y < 0 || x >= g.w || y >= g.h) continue;
-                
-                float dx = x + 0.5f - cx;
-                float dy = y + 0.5f - cy;
-                if (dx * dx + dy * dy > r * r) continue; // outside the circle
-                
-                sum += g.px[(size_t)y * g.w + x];
-                ++count;
-            }
-        }
-        
-        if (count > 0) return sum / count;
-        
-        // Circle was tiny or the step skipped everything: fall back to the center pixel.
-        int px = (int)cx, py = (int)cy;
-        if (px >= 0 && py >= 0 && px < g.w && py < g.h) return g.px[(size_t)py * g.w + px];
-        return 0.0f;
+        char log[1024];
+        glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+        SDL_Log("Shader compile failed: %s", log);
+    }
+    return s;
+}
+
+bool initAsciiPass()
+{
+    AsciiPass& p = g_pass;
+
+    // Drop the file's own #version line, GLSL_VERSION replaces it
+    const char* frag = (const char*)ascii_frag;
+    const char* end = frag + sizeof(ascii_frag);
+    const char* body = (const char*)std::memchr(frag, '\n', sizeof(ascii_frag)) + 1;
+
+    GLuint vs = compileShader(GL_VERTEX_SHADER, FULLSCREEN_VS, -1);
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, body, (int)(end - body));
+    p.prog = glCreateProgram();
+    glAttachShader(p.prog, vs);
+    glAttachShader(p.prog, fs);
+    glLinkProgram(p.prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    GLint ok;
+    glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char log[1024];
+        glGetProgramInfoLog(p.prog, sizeof(log), nullptr, log);
+        SDL_Log("Shader link failed: %s", log);
+        p.prog = 0;
+        return false;
     }
 
-    ExtVec sampleExternal(const Gray& g, float ox, float oy, float cw, float ch, int step)
+    p.uImage = glGetUniformLocation(p.prog, "uImage");
+    p.uCell = glGetUniformLocation(p.prog, "uCell");
+    p.uCircles = glGetUniformLocation(p.prog, "uCircles");
+    p.uExt = glGetUniformLocation(p.prog, "uExt");
+    p.uExponent = glGetUniformLocation(p.prog, "uExponent");
+    p.uStep = glGetUniformLocation(p.prog, "uStep");
+
+    glGenVertexArrays(1, &p.vao);
+    glGenFramebuffers(1, &p.fbo);
+    glGenTextures(2, p.out);
+
+#ifdef __EMSCRIPTEN__
+    // WebGL 2 can only render to float textures with this
+    emscripten_webgl_enable_extension(emscripten_webgl_get_current_context(), "EXT_color_buffer_float");
+#endif
+    return true;
+}
+
+void resizeTargets(int cols, int rows)
+{
+    AsciiPass& p = g_pass;
+    if (cols == p.cols && rows == p.rows) return;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, p.fbo);
+    for (int i = 0; i < 2; ++i)
     {
-        ExtVec e;
-        for(int i = 0; i < ECC; i++)
-            e[i] = sampleCircle(g, ox, oy, cw, ch, g_extCircles[i], step);
-        return e;
+        glBindTexture(GL_TEXTURE_2D, p.out[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, cols, rows, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, p.out[i], 0);
     }
-    
-    Vec sampleCell(const Gray& g, float ox, float oy, float cw, float ch, int step)
+    const GLenum bufs[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+    glDrawBuffers(2, bufs);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        SDL_Log("ASCII framebuffer is incomplete");
+
+    p.cols = cols;
+    p.rows = rows;
+    p.v0123.resize((size_t)cols * rows * 4);
+    p.v45.resize((size_t)cols * rows * 4);
+}
+
+std::vector<Vec> runPass(GLuint tex, int cols, int rows, float cw, float ch, int step, float exponent)
+{
+    AsciiPass& p = g_pass;
+    resizeTargets(cols, rows);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, p.fbo);
+    glViewport(0, 0, cols, rows);
+    glUseProgram(p.prog);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(p.uImage, 0);
+    glUniform2f(p.uCell, cw, ch);
+    glUniform3fv(p.uCircles, N, &g_circles[0].cx);
+    glUniform3fv(p.uExt, ECC, &g_extCircles[0].cx);
+    glUniform1f(p.uExponent, exponent);
+    glUniform1i(p.uStep, step);
+    glBindVertexArray(p.vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(0, 0, cols, rows, GL_RGBA, GL_FLOAT, p.v0123.data());
+    glReadBuffer(GL_COLOR_ATTACHMENT1);
+    glReadPixels(0, 0, cols, rows, GL_RGBA, GL_FLOAT, p.v45.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    std::vector<Vec> out((size_t)cols * rows);
+    for (size_t i = 0; i < out.size(); ++i)
     {
-        Vec v;
-        for (int i = 0; i < N; ++i)
-        v[i] = sampleCircle(g, ox, oy, cw, ch, g_circles[i], step);
-    return v;
+        const float* a = &p.v0123[i * 4];
+        const float* b = &p.v45[i * 4];
+        out[i] = { a[0], a[1], a[2], a[3], b[0], b[1] };
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -360,22 +464,26 @@ std::vector<Glyph> buildGlyphs(float fontScale)
     // Center the line box vertically (ascent to descent), like StringAlignmentCenter
     float baseline = (gh - (ascent - descent) * scale) / 2 + ascent * scale;
 
-    Gray gray;
-    gray.w = gw;
-    gray.h = gh;
+    // Glyphs on black in a grid, with an empty cell around each one:
+    // circles reach past the cell edge and must not see a neighbouring glyph
+    const int count = 127 - 32;
+    const int perRow = 10;
+    const int cols = 2 * perRow + 1;
+    const int rows = 2 * ((count + perRow - 1) / perRow) + 1;
+    const int aw = gw * cols, ah = gh * rows;
+    std::vector<unsigned char> atlas((size_t)aw * ah * 4, 0);
 
-    std::vector<Glyph> glyphs;
-
-    for (char c = 32; c < 127; ++c)
+    for (int i = 0; i < count; ++i)
     {
-        gray.px.assign((size_t)gw * gh, 0.0f); // black cell
+        char c = (char)(32 + i);
+        int cx = (2 * (i % perRow) + 1) * gw, cy = (2 * (i / perRow) + 1) * gh;
 
         // Center the character's advance horizontally
         int advance, lsb;
         stbtt_GetCodepointHMetrics(&g_font, c, &advance, &lsb);
         float x = (gw - advance * scale) / 2;
 
-        // Draw white text: coverage 0..255 becomes lightness 0..1
+        // Draw white text, opaque because gray() multiplies by alpha
         int ox = (int)std::floor(x), oy = (int)std::floor(baseline);
         int bw, bh, xoff, yoff;
         unsigned char* bmp = stbtt_GetCodepointBitmapSubpixel(&g_font, scale, scale,
@@ -386,14 +494,31 @@ std::vector<Glyph> buildGlyphs(float fontScale)
             {
                 int px = ox + xoff + xx, py = oy + yoff + y;
                 if (px < 0 || py < 0 || px >= gw || py >= gh) continue;
-                gray.px[(size_t)py * gw + px] = bmp[y * bw + xx] / 255.0f;
+                unsigned char* d = &atlas[((size_t)(cy + py) * aw + cx + px) * 4];
+                d[0] = d[1] = d[2] = bmp[y * bw + xx];
             }
         }
         stbtt_FreeBitmap(bmp, nullptr);
+    }
+    for (size_t k = 3; k < atlas.size(); k += 4) atlas[k] = 255;
 
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, aw, ah, 0, GL_RGBA, GL_UNSIGNED_BYTE, atlas.data());
+
+    // Exponent 1 skips the contrast passes, glyphs are sampled as drawn
+    std::vector<Vec> vs = runPass(tex, cols, rows, (float)gw, (float)gh, 1, 1.0f);
+    glDeleteTextures(1, &tex);
+
+    std::vector<Glyph> glyphs;
+    for (int i = 0; i < count; ++i)
+    {
         Glyph gl;
-        gl.ch = c;
-        gl.v = sampleCell(gray, 0, 0, (float)gw, (float)gh, 1);
+        gl.ch = (char)(32 + i);
+        gl.v = vs[(size_t)(2 * (i / perRow) + 1) * cols + 2 * (i % perRow) + 1];
         glyphs.push_back(gl);
     }
 
@@ -411,56 +536,29 @@ std::vector<Glyph> buildGlyphs(float fontScale)
     return glyphs;
 }
 
-// Global contrast enhancement
-void enhanceContrast(Vec& v, float exponent)
-{
-    float m = *std::max_element(v.begin(), v.end());
-    if (m <= 0.0f) return;
-    for (int i = 0; i < N; ++i)
-        v[i] = std::pow(v[i] / m, exponent) * m;
-}
-
-void enhanceDirectional(Vec& v, const ExtVec& ext, float exponent)
-{
-    for (int i = 0; i < N; ++i)
-    {
-        float m = v[i];                          // the circle's own value
-        for (int e : AFFECTING[i])               // plus the external circles that affect it
-            if (ext[e] > m) m = ext[e];
-        if (m > 0.0f) v[i] = std::pow(v[i] / m, exponent) * m;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Image -> lines of ASCII, using the current slider values
 // ---------------------------------------------------------------------------
 void renderAscii()
 {
     g_lines.clear();
-    if (g_gray.w == 0) return;
+    if (!g_imageReady || !g_pass.prog) return;
 
     int cols = (int)(val(P_COLS) + 0.5f);
     int step = (int)(val(P_STEP) + 0.5f);
     float exponent = val(P_CONTRAST);
 
-    float cw = (float)g_gray.w / cols;
+    float cw = (float)g_mediaW / cols;
     float ch = cw * 2.0f; // console characters are ~1:2
-    int rows = (int)(g_gray.h / ch);
+    int rows = (int)(g_mediaH / ch);
+    if (rows <= 0) return;
 
+    std::vector<Vec> cells = runPass(g_image, cols, rows, cw, ch, step, exponent);
     for (int r = 0; r < rows; ++r)
     {
         std::string line;
         for (int c = 0; c < cols; ++c)
-        {
-            Vec v = sampleCell(g_gray, c * cw, r * ch, cw, ch, step);
-            if (exponent > 1.001f) 
-            {
-                ExtVec ext = sampleExternal(g_gray, c * cw, r * ch, cw, ch, step);
-                enhanceDirectional(v, ext, exponent);
-                enhanceContrast(v, exponent);
-            }
-            line += findBestCharKd(v);
-        }
+            line += findBestCharKd(cells[(size_t)r * cols + c]);
         g_lines.push_back(line);
     }
 }
@@ -494,11 +592,10 @@ void onParamsChanged()
 enum MediaKind { M_NONE, M_IMAGE, M_GIF, M_VIDEO };
 
 MediaKind g_kind = M_NONE;
-int g_mediaW = 0, g_mediaH = 0;
 bool g_playing = false;
 double g_time = 0;      // playback position, seconds
 double g_duration = 0;  // 0 = unknown
-int g_frameShown = -1;  // index of the frame in g_gray / g_lines
+int g_frameShown = -1;  // index of the frame in g_image / g_lines
 
 // GIF: every frame is decoded up front
 std::vector<unsigned char> g_gifPixels; // RGBA, frame after frame
@@ -506,18 +603,24 @@ std::vector<double> g_gifStart;         // start time of each frame, seconds
 
 std::vector<unsigned char> g_videoFrame; // the video frame the main thread is converting
 
-void createPreview(int w, int h, SDL_TextureAccess access)
+void createPreview(int w, int h)
 {
-    SDL_DestroyTexture(g_image);
-    g_image = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, access, w, h);
+    if (!g_image) glGenTextures(1, &g_image);
+    glBindTexture(GL_TEXTURE_2D, g_image);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     g_mediaW = w;
     g_mediaH = h;
 }
 
 void showFrame(const unsigned char* rgba)
 {
-    if (g_image) SDL_UpdateTexture(g_image, nullptr, rgba, g_mediaW * 4);
-    g_gray = toGray(rgba, g_mediaW, g_mediaH);
+    glBindTexture(GL_TEXTURE_2D, g_image);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g_mediaW, g_mediaH, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    g_imageReady = true;
     renderAscii();
 }
 
@@ -528,7 +631,7 @@ void startMedia(MediaKind kind, double duration)
     g_time = 0;
     g_playing = kind == M_GIF || kind == M_VIDEO;
     g_frameShown = -1;
-    g_gray = Gray();
+    g_imageReady = false;
     g_lines.clear();
 }
 
@@ -648,7 +751,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void webVideoReady(int w, int h, double duration
     v.w = w;
     v.h = h;
     startMedia(M_VIDEO, duration);
-    createPreview(w, h, SDL_TEXTUREACCESS_STREAMING);
+    createPreview(w, h);
     g_videoFrame.assign((size_t)w * h * 4, 0);
 }
 
@@ -831,7 +934,7 @@ bool loadVideo(const std::string& path)
     v.fps = probed.fps;
     v.rate = probed.rate;
     startMedia(M_VIDEO, duration);
-    createPreview(v.w, v.h, SDL_TEXTUREACCESS_STREAMING);
+    createPreview(v.w, v.h);
     g_videoFrame.assign((size_t)v.w * v.h * 4, 0);
     return startVideo(0);
 }
@@ -845,7 +948,7 @@ bool loadImage(const std::string& path)
 
     stopVideo();
     startMedia(M_IMAGE, 0);
-    createPreview(w, h, SDL_TEXTUREACCESS_STATIC);
+    createPreview(w, h);
     showFrame(rgba);
     stbi_image_free(rgba);
     return true;
@@ -887,7 +990,7 @@ bool loadGif(const std::string& path)
     stbi_image_free(delays);
 
     startMedia(frames > 1 ? M_GIF : M_IMAGE, t);
-    createPreview(w, h, SDL_TEXTUREACCESS_STREAMING);
+    createPreview(w, h);
     showFrame(g_gifPixels.data());
     g_frameShown = 0;
     return true;
@@ -1043,8 +1146,7 @@ void paintPreview()
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.y < 20) return;
 
-    float iw, ih;
-    SDL_GetTextureSize(g_image, &iw, &ih);
+    float iw = (float)g_mediaW, ih = (float)g_mediaH;
     float scale = avail.x / iw;
     if (avail.y / ih < scale) scale = avail.y / ih;
 
@@ -1151,18 +1253,19 @@ void runFrame()
 
     updatePlayback();
 
-    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
     drawUi(g_dpi, g_uiFont);
     ImGui::Render();
 
     ImGuiIO& io = ImGui::GetIO();
-    SDL_SetRenderScale(g_renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
-    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
-    SDL_RenderClear(g_renderer);
-    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_renderer);
-    SDL_RenderPresent(g_renderer);
+    glViewport(0, 0, (int)(io.DisplaySize.x * io.DisplayFramebufferScale.x),
+        (int)(io.DisplaySize.y * io.DisplayFramebufferScale.y));
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    SDL_GL_SwapWindow(g_window);
 }
 
 #ifdef __EMSCRIPTEN__
@@ -1189,20 +1292,30 @@ int main(int argc, char** argv)
     float dpi = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (dpi <= 0) dpi = 1;
     g_dpi = dpi;
-    SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #ifdef __EMSCRIPTEN__
     flags |= SDL_WINDOW_FILL_DOCUMENT; // the canvas follows the browser window's size
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#else
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG); // macOS needs it
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
 #endif
     g_window = SDL_CreateWindow("ASCII renderer", (int)(1200 * dpi), (int)(800 * dpi), flags);
-    g_renderer = g_window ? SDL_CreateRenderer(g_window, nullptr) : nullptr;
-    if (!g_renderer)
+    g_gl = g_window ? SDL_GL_CreateContext(g_window) : nullptr;
+    if (!g_gl || !loadGl())
     {
         SDL_Log("Could not create the window: %s", SDL_GetError());
         return 1;
     }
+    SDL_GL_MakeCurrent(g_window, g_gl);
 #ifndef __EMSCRIPTEN__
-    SDL_SetRenderVSync(g_renderer, 1); // the browser already paces frames to the display
+    SDL_GL_SetSwapInterval(1); // the browser already paces frames to the display
 #endif
+    if (!initAsciiPass()) return 1;
 
     stbtt_InitFont(&g_font, font_data, stbtt_GetFontOffsetForIndex(font_data, 0));
 
@@ -1220,8 +1333,8 @@ int main(int argc, char** argv)
     cfg.FontDataOwnedByAtlas = false;
     g_uiFont = io.Fonts->AddFontFromMemoryTTF((void*)font_data, (int)sizeof(font_data), 15.0f, &cfg);
 
-    ImGui_ImplSDL3_InitForSDLRenderer(g_window, g_renderer);
-    ImGui_ImplSDLRenderer3_Init(g_renderer);
+    ImGui_ImplSDL3_InitForOpenGL(g_window, g_gl);
+    ImGui_ImplOpenGL3_Init(GLSL_VERSION);
 
     for (Param& p : P) p.pos = p.init;
     onParamsChanged(); // builds glyphs
@@ -1247,11 +1360,10 @@ int main(int argc, char** argv)
     }
 
     stopVideo();
-    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
-    SDL_DestroyTexture(g_image);
-    SDL_DestroyRenderer(g_renderer);
+    SDL_GL_DestroyContext(g_gl);
     SDL_DestroyWindow(g_window);
     SDL_Quit();
     return 0;

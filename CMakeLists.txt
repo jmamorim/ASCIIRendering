@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
-# SDL3: window, renderer, file dialog, clipboard. Use the system copy if there
+# SDL3: window, OpenGL context, file dialog, clipboard. Use the system copy if there
 # is one (Linux: pacman -S sdl3 / apt install libsdl3-dev), otherwise build it.
 find_package(SDL3 CONFIG QUIET)
 if(NOT SDL3_FOUND)
@@ -36,7 +36,7 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp)
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC SDL3::SDL3)
 
@@ -48,17 +48,31 @@ add_custom_command(
             -DOUT=${FONT_HEADER} -DNAME=font_data -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed.cmake
     DEPENDS assets/DejaVuSansMono.ttf cmake/embed.cmake)
 
-add_executable(ASCIIRendering WIN32 ASCIIRendering/ASCIIRendering.cpp ${FONT_HEADER})
+set(SHADER_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/ascii_frag.h)
+add_custom_command(
+    OUTPUT ${SHADER_HEADER}
+    COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_CURRENT_SOURCE_DIR}/ASCIIRendering/ascii.frag
+            -DOUT=${SHADER_HEADER} -DNAME=ascii_frag -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed.cmake
+    DEPENDS ASCIIRendering/ascii.frag cmake/embed.cmake)
+
+add_executable(ASCIIRendering WIN32 ASCIIRendering/ASCIIRendering.cpp ${FONT_HEADER} ${SHADER_HEADER})
 target_include_directories(ASCIIRendering PRIVATE ${stb_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(ASCIIRendering PRIVATE imgui SDL3::SDL3)
 if(MSVC)
     target_compile_options(ASCIIRendering PRIVATE /utf-8)
 endif()
+if(NOT EMSCRIPTEN)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(ASCIIRendering PRIVATE OpenGL::GL)
+endif()
 
 # Web build (emcmake cmake ...): index.html + index.js + index.wasm
 if(EMSCRIPTEN)
     set_target_properties(ASCIIRendering PROPERTIES OUTPUT_NAME index SUFFIX .html)
+    target_compile_definitions(imgui PUBLIC IMGUI_IMPL_OPENGL_ES3)
     target_link_options(ASCIIRendering PRIVATE
+        -sMIN_WEBGL_VERSION=2
+        -sMAX_WEBGL_VERSION=2
         -sALLOW_MEMORY_GROWTH=1
         -sMAXIMUM_MEMORY=4GB
         -sMINIFY_HTML=0

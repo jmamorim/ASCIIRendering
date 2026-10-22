@@ -39,6 +39,9 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC SDL3::SDL3)
+# 32-bit indices: the ASCII panel passes 65535 vertices at high column counts,
+# and WebGL has no glDrawElementsBaseVertex to split it into 16-bit chunks
+target_compile_definitions(imgui PUBLIC "ImDrawIdx=unsigned int")
 
 # The glyph font is compiled into the program so it runs the same everywhere
 set(FONT_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/font_data.h)

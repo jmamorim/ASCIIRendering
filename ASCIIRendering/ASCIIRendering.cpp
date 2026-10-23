@@ -11,6 +11,9 @@
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_opengl3.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_WINDOWS_UTF8 // SDL hands us UTF-8 paths, also on Windows
 #include "stb_image.h"
@@ -225,6 +228,7 @@ int buildKd(std::vector<int>& idx, int lo, int hi, int depth)
     g_kd[me].right = r;
     return me;
 }
+
 // ---------------------------------------------------------------------------
 // Kd Tree 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1105,149 @@ void copyToClipboard()
 }
 
 // ---------------------------------------------------------------------------
+// Export the ASCII output as an image file
+// ---------------------------------------------------------------------------
+enum ExportFormat { E_PNG, E_JPG, E_BMP };
+const char* EXPORT_FORMATS[] = { "PNG", "JPG", "BMP" };
+
+int g_exportFormat = E_PNG;
+int g_exportCharH = 16; // pixel height of one character, width is half of it
+
+#ifdef __EMSCRIPTEN__
+// Browser: hand the bytes to the page as a download
+EM_JS(void, jsDownload, (const char* name, const unsigned char* data, int size), {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([HEAPU8.slice(data, data + size)]));
+    a.download = UTF8ToString(name);
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+
+void saveExport(const char* ext, std::vector<unsigned char> bytes)
+{
+    jsDownload((std::string("ascii.") + ext).c_str(), bytes.data(), (int)bytes.size());
+}
+#else
+std::vector<unsigned char> g_exportBytes;
+std::string g_exportExt;
+
+void SDLCALL onSavePicked(void*, const char* const* files, int)
+{
+    if (!files || !files[0]) return; // error or cancelled
+    std::string path = files[0];
+    if (!path.ends_with("." + g_exportExt)) path += "." + g_exportExt;
+    SDL_SaveFile(path.c_str(), g_exportBytes.data(), g_exportBytes.size());
+}
+
+void saveExport(const char* ext, std::vector<unsigned char> bytes)
+{
+    g_exportBytes = std::move(bytes);
+    g_exportExt = ext;
+    static SDL_DialogFileFilter filter;
+    filter = { "Image", g_exportExt.c_str() };
+    SDL_ShowSaveFileDialog(onSavePicked, nullptr, g_window, &filter, 1, "ascii");
+}
+#endif
+
+void exportAsciiImage(ExportFormat format, int charH)
+{
+    int rows = (int)g_lines.size();
+    int cols = (int)g_lines[0].size();
+    int cw = charH / 2;
+    int w = cols * cw, h = rows * charH;
+    std::vector<unsigned char> pixels((size_t)w * h, 0);
+
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(&g_font, &ascent, &descent, &lineGap);
+    int advance, lsb;
+    stbtt_GetCodepointHMetrics(&g_font, 'M', &advance, &lsb);
+
+    float scale = std::min((float)charH / (ascent - descent), (float)cw / advance);
+
+    float x = (cw - advance * scale) / 2;
+    float baseline = (charH - (ascent - descent) * scale) / 2 + ascent * scale;
+    int ox = (int)std::floor(x), oy = (int)std::floor(baseline);
+
+    std::vector<std::vector<unsigned char>> tiles(95, std::vector<unsigned char>((size_t)cw * charH, 0));
+    for (int i = 0; i < 95; ++i)
+    {
+        int bw, bh, xoff, yoff;
+        unsigned char* bmp = stbtt_GetCodepointBitmapSubpixel(&g_font, scale, scale,
+            x - ox, baseline - oy, 32 + i, &bw, &bh, &xoff, &yoff);
+        for (int y = 0; y < bh; ++y)
+        {
+            for (int xx = 0; xx < bw; ++xx)
+            {
+                int px = ox + xoff + xx, py = oy + yoff + y;
+                if (px < 0 || py < 0 || px >= cw || py >= charH) continue;
+                tiles[i][(size_t)py * cw + px] = bmp[y * bw + xx];
+            }
+        }
+        stbtt_FreeBitmap(bmp, nullptr);
+    }
+
+    for (int r = 0; r < rows; ++r)
+    {
+        for (int c = 0; c < cols; ++c)
+        {
+            unsigned char ch = (unsigned char)g_lines[r][c];
+            if (ch < 32 || ch > 126) continue;
+            const std::vector<unsigned char>& tile = tiles[ch - 32];
+            for (int y = 0; y < charH; ++y)
+                std::memcpy(&pixels[(size_t)(r * charH + y) * w + c * cw], &tile[(size_t)y * cw], cw);
+        }
+    }
+
+    std::vector<unsigned char> file;
+    auto append = [](void* ctx, void* data, int size) {
+        auto* out = (std::vector<unsigned char>*)ctx;
+        out->insert(out->end(), (unsigned char*)data, (unsigned char*)data + size);
+    };
+    const char* ext = "png";
+    switch (format)
+    {
+        case E_PNG: stbi_write_png_to_func(append, &file, w, h, 1, pixels.data(), w); ext = "png"; break;
+        case E_JPG: stbi_write_jpg_to_func(append, &file, w, h, 1, pixels.data(), 90); ext = "jpg"; break;
+        case E_BMP: stbi_write_bmp_to_func(append, &file, w, h, 1, pixels.data()); ext = "bmp"; break;
+    }
+
+    saveExport(ext, std::move(file));
+}
+
+void openExportPopup()
+{
+    // Start at the cell height the image was sampled with, so the output is about the source size
+    g_exportCharH = std::clamp(g_mediaH / (int)g_lines.size(), 4, 64);
+    ImGui::OpenPopup("Export image");
+}
+
+void showExportPopup()
+{
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Export image", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    int rows = (int)g_lines.size();
+    int cols = rows ? (int)g_lines[0].size() : 0;
+
+    ImGui::Combo("Format", &g_exportFormat, EXPORT_FORMATS, IM_ARRAYSIZE(EXPORT_FORMATS));
+    ImGui::SliderInt("Char height", &g_exportCharH, 4, 64, "%d px");
+    ImGui::Text("Output: %d x %d px", cols * (g_exportCharH / 2), rows * g_exportCharH);
+    ImGui::Spacing();
+
+    if (ImGui::Button("Export"))
+    {
+        exportAsciiImage((ExportFormat)g_exportFormat, g_exportCharH);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape))
+        ImGui::CloseCurrentPopup();
+
+    ImGui::EndPopup();
+}
+
+// ---------------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------------
 void paintAscii(ImFont* font)
@@ -1173,6 +1320,11 @@ void drawUi(float dpi, ImFont* font)
     ImGui::SameLine();
     if (ImGui::Button("Copy text", ImVec2(half, 0)))
         copyToClipboard();
+    ImGui::BeginDisabled(g_kind != M_IMAGE || g_lines.empty());
+    if (ImGui::Button("Export image...", ImVec2(-1, 0)))
+        openExportPopup();
+    ImGui::EndDisabled();
+    showExportPopup();
     ImGui::Spacing();
 
     if (g_kind == M_GIF || g_kind == M_VIDEO)

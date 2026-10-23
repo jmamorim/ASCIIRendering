@@ -1111,7 +1111,9 @@ enum ExportFormat { E_PNG, E_JPG, E_BMP };
 const char* EXPORT_FORMATS[] = { "PNG", "JPG", "BMP" };
 
 int g_exportFormat = E_PNG;
-int g_exportCharH = 16; // pixel height of one character, width is half of it
+int g_exportScale = 1;
+ImVec2 g_asciiMin, g_asciiMax; // where paintAscii drew the characters, in window points
+int g_exportIn = 0;            // frames until the screenshot, so the popup is gone first
 
 #ifdef __EMSCRIPTEN__
 // Browser: hand the bytes to the page as a download
@@ -1149,53 +1151,32 @@ void saveExport(const char* ext, std::vector<unsigned char> bytes)
 }
 #endif
 
-void exportAsciiImage(ExportFormat format, int charH)
+// Screenshot of the ASCII area in the frame just drawn, so call it before the swap
+void exportAsciiImage()
 {
-    int rows = (int)g_lines.size();
-    int cols = (int)g_lines[0].size();
-    int cw = charH / 2;
-    int w = cols * cw, h = rows * charH;
-    std::vector<unsigned char> pixels((size_t)w * h, 0);
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 s = io.DisplayFramebufferScale;
+    int x = (int)(g_asciiMin.x * s.x);
+    int y = (int)((io.DisplaySize.y - g_asciiMax.y) * s.y); // GL counts rows from the bottom
+    int w = (int)((g_asciiMax.x - g_asciiMin.x) * s.x);
+    int h = (int)((g_asciiMax.y - g_asciiMin.y) * s.y);
+    if (w <= 0 || h <= 0) return;
 
-    int ascent, descent, lineGap;
-    stbtt_GetFontVMetrics(&g_font, &ascent, &descent, &lineGap);
-    int advance, lsb;
-    stbtt_GetCodepointHMetrics(&g_font, 'M', &advance, &lsb);
+    std::vector<unsigned char> pixels((size_t)w * h * 4);
+    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    for (size_t k = 3; k < pixels.size(); k += 4) pixels[k] = 255;
 
-    float scale = std::min((float)charH / (ascent - descent), (float)cw / advance);
-
-    float x = (cw - advance * scale) / 2;
-    float baseline = (charH - (ascent - descent) * scale) / 2 + ascent * scale;
-    int ox = (int)std::floor(x), oy = (int)std::floor(baseline);
-
-    std::vector<std::vector<unsigned char>> tiles(95, std::vector<unsigned char>((size_t)cw * charH, 0));
-    for (int i = 0; i < 95; ++i)
+    // Bigger image: repeat each pixel k x k times, which keeps the edges sharp instead of blurring
+    int k = g_exportScale;
+    if (k > 1)
     {
-        int bw, bh, xoff, yoff;
-        unsigned char* bmp = stbtt_GetCodepointBitmapSubpixel(&g_font, scale, scale,
-            x - ox, baseline - oy, 32 + i, &bw, &bh, &xoff, &yoff);
-        for (int y = 0; y < bh; ++y)
-        {
-            for (int xx = 0; xx < bw; ++xx)
-            {
-                int px = ox + xoff + xx, py = oy + yoff + y;
-                if (px < 0 || py < 0 || px >= cw || py >= charH) continue;
-                tiles[i][(size_t)py * cw + px] = bmp[y * bw + xx];
-            }
-        }
-        stbtt_FreeBitmap(bmp, nullptr);
-    }
-
-    for (int r = 0; r < rows; ++r)
-    {
-        for (int c = 0; c < cols; ++c)
-        {
-            unsigned char ch = (unsigned char)g_lines[r][c];
-            if (ch < 32 || ch > 126) continue;
-            const std::vector<unsigned char>& tile = tiles[ch - 32];
-            for (int y = 0; y < charH; ++y)
-                std::memcpy(&pixels[(size_t)(r * charH + y) * w + c * cw], &tile[(size_t)y * cw], cw);
-        }
+        std::vector<unsigned char> big((size_t)w * k * h * k * 4);
+        for (int by = 0; by < h * k; ++by)
+            for (int bx = 0; bx < w * k; ++bx)
+                std::memcpy(&big[((size_t)by * w * k + bx) * 4], &pixels[((size_t)(by / k) * w + bx / k) * 4], 4);
+        pixels.swap(big);
+        w *= k;
+        h *= k;
     }
 
     std::vector<unsigned char> file;
@@ -1203,22 +1184,17 @@ void exportAsciiImage(ExportFormat format, int charH)
         auto* out = (std::vector<unsigned char>*)ctx;
         out->insert(out->end(), (unsigned char*)data, (unsigned char*)data + size);
     };
+
+    stbi_flip_vertically_on_write(1); // glReadPixels gives the bottom row first
     const char* ext = "png";
-    switch (format)
+    switch (g_exportFormat)
     {
-        case E_PNG: stbi_write_png_to_func(append, &file, w, h, 1, pixels.data(), w); ext = "png"; break;
-        case E_JPG: stbi_write_jpg_to_func(append, &file, w, h, 1, pixels.data(), 90); ext = "jpg"; break;
-        case E_BMP: stbi_write_bmp_to_func(append, &file, w, h, 1, pixels.data()); ext = "bmp"; break;
+        case E_PNG: stbi_write_png_to_func(append, &file, w, h, 4, pixels.data(), w * 4); ext = "png"; break;
+        case E_JPG: stbi_write_jpg_to_func(append, &file, w, h, 4, pixels.data(), 90); ext = "jpg"; break;
+        case E_BMP: stbi_write_bmp_to_func(append, &file, w, h, 4, pixels.data()); ext = "bmp"; break;
     }
 
     saveExport(ext, std::move(file));
-}
-
-void openExportPopup()
-{
-    // Start at the cell height the image was sampled with, so the output is about the source size
-    g_exportCharH = std::clamp(g_mediaH / (int)g_lines.size(), 4, 64);
-    ImGui::OpenPopup("Export image");
 }
 
 void showExportPopup()
@@ -1227,17 +1203,16 @@ void showExportPopup()
     if (!ImGui::BeginPopupModal("Export image", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
 
-    int rows = (int)g_lines.size();
-    int cols = rows ? (int)g_lines[0].size() : 0;
-
+    ImVec2 s = ImGui::GetIO().DisplayFramebufferScale;
     ImGui::Combo("Format", &g_exportFormat, EXPORT_FORMATS, IM_ARRAYSIZE(EXPORT_FORMATS));
-    ImGui::SliderInt("Char height", &g_exportCharH, 4, 64, "%d px");
-    ImGui::Text("Output: %d x %d px", cols * (g_exportCharH / 2), rows * g_exportCharH);
+    ImGui::SliderInt("Scale", &g_exportScale, 1, 4, "%dx");
+    ImGui::Text("Output: %d x %d px", (int)((g_asciiMax.x - g_asciiMin.x) * s.x) * g_exportScale,
+        (int)((g_asciiMax.y - g_asciiMin.y) * s.y) * g_exportScale);
     ImGui::Spacing();
 
     if (ImGui::Button("Export"))
     {
-        exportAsciiImage((ExportFormat)g_exportFormat, g_exportCharH);
+        g_exportIn = 2;
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
@@ -1281,6 +1256,9 @@ void paintAscii(ImFont* font)
     float advance = font->CalcTextSizeA(100.0f, FLT_MAX, 0.0f, "M").x / 100.0f;
     float fontSize = cell / advance;
 
+    g_asciiMin = p;
+    g_asciiMax = ImVec2(p.x + (float)(cols * cell), p.y + (float)(rows * cell * 2));
+
     for (int i = 0; i < rows; ++i)
         dl->AddText(font, fontSize, ImVec2(p.x, p.y + (float)(i * cell * 2)),
             IM_COL32(255, 255, 255, 255), g_lines[i].c_str());
@@ -1322,7 +1300,7 @@ void drawUi(float dpi, ImFont* font)
         copyToClipboard();
     ImGui::BeginDisabled(g_kind != M_IMAGE || g_lines.empty());
     if (ImGui::Button("Export image...", ImVec2(-1, 0)))
-        openExportPopup();
+        ImGui::OpenPopup("Export image");
     ImGui::EndDisabled();
     showExportPopup();
     ImGui::Spacing();
@@ -1417,6 +1395,7 @@ void runFrame()
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    if (g_exportIn > 0 && --g_exportIn == 0) exportAsciiImage();
     SDL_GL_SwapWindow(g_window);
 }
 

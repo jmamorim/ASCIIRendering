@@ -4,8 +4,10 @@
 
 This project is an experiment that was inspired by Alex Harri's blog "ASCII characters are not pixels: a deep dive into ASCII rendering", it was a good starting point for me to learn about ASCII rendering of images/videos and even how to use web assembly to deploy on github pages the project in this case, which is mindblowing what can be done with web assembly. Its still work in progress.
 
+This app is available on the web: https://jmamorim.github.io/ASCIIRendering/
+
 Latest update:
-Glyph lookup changed from the old brute force approach to Kd-Tree usage.
+Export as image.
 
 ## Instructions
 

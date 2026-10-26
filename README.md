@@ -7,18 +7,19 @@ This project is an experiment that was inspired by Alex Harri's blog "ASCII char
 This app is available on the web: https://jmamorim.github.io/ASCIIRendering/
 
 Latest update:
-Export as image.
+Export as video.
 
-## Instructions
+## Using it
 
-Open an image, GIF or video, then drag the sliders to see the ASCII output
-change live.
-Runs on Windows, macOS, Linux and in the browser (SDL3 + Dear ImGui, compiled
-to WebAssembly for the web).
-
-The build needs CMake 3.24+, a C++20 compiler and internet access the first
-time: Dear ImGui, stb and (when it isn't installed) SDL3 are downloaded while
-configuring.
+- Open an image, GIF or video with **Open file...**, by dropping it on the
+  window, or by passing its path when starting the program.
+- GIFs and videos play in a loop at their real speed; when converting a frame
+  takes longer than the frame lasts, frames are skipped. **Pause**/**Play**
+  and the slider under it pause and seek.
+- Drag the sliders; the ASCII output on the right updates as you go.
+- **Copy text** puts the ASCII output (the current frame) on the clipboard.
+- **Export image/video** puts the output in 
+as an image or video format.
 
 ## Project structure
 
@@ -42,6 +43,17 @@ All source files are in `src/`.
 | `export.h/.cpp` | clipboard, image export, video export, export popups |
 | `ui.h/.cpp` | left panel, painting the output, `onParamsChanged()` |
 | `ascii.frag` | the ASCII shader |
+
+## Instructions
+
+Open an image, GIF or video, then drag the sliders to see the ASCII output
+change live.
+Runs on Windows, macOS, Linux and in the browser (SDL3 + Dear ImGui, compiled
+to WebAssembly for the web).
+
+The build needs CMake 3.24+, a C++20 compiler and internet access the first
+time: Dear ImGui, stb and (when it isn't installed) SDL3 are downloaded while
+configuring.
 
 ## Windows
 
@@ -144,16 +156,6 @@ mov, ...) are decoded by the `ffmpeg` and `ffprobe` programs, which must be on P
     brew install ffmpeg
     # Arch / Debian / Fedora
     sudo pacman -S ffmpeg / sudo apt install ffmpeg / sudo dnf install ffmpeg
-
-## Using it
-
-- Open an image, GIF or video with **Open file...**, by dropping it on the
-  window, or by passing its path when starting the program.
-- GIFs and videos play in a loop at their real speed; when converting a frame
-  takes longer than the frame lasts, frames are skipped. **Pause**/**Play**
-  and the slider under it pause and seek.
-- Drag the sliders; the ASCII output on the right updates as you go.
-- **Copy text** puts the ASCII output (the current frame) on the clipboard.
 
 The glyphs are matched against DejaVu Sans Mono, which is compiled into the
 program (`assets/`, see `assets/DejaVu-LICENSE.txt`).

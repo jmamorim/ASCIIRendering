@@ -37,36 +37,22 @@ static float g_dpi = 1;
 static ImFont* g_uiFont = nullptr;
 static bool g_done = false;
 
-// While a video export runs, the media must not change under it
-static bool exportBusy()
-{
-#ifdef __EMSCRIPTEN__
-    return false;
-#else
-    return videoExportRunning();
-#endif
-}
-
 static void handleEvent(const SDL_Event& e)
 {
     ImGui_ImplSDL3_ProcessEvent(&e);
     if (e.type == SDL_EVENT_QUIT) g_done = true;
-    if (e.type == SDL_EVENT_DROP_FILE && !exportBusy()) openFile(e.drop.data);
+    if (e.type == SDL_EVENT_DROP_FILE && !videoExportRunning()) openFile(e.drop.data);
 }
 
 // Everything after the events: open a picked file, advance playback, draw
 static void runFrame()
 {
     std::string picked = takePickedFile();
-    if (!picked.empty() && !exportBusy()) openFile(picked);
+    if (!picked.empty() && !videoExportRunning()) openFile(picked);
 
     if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) return;
 
-#ifdef __EMSCRIPTEN__
-    updatePlayback();
-#else
     if (!exportVideoFrame()) updatePlayback();
-#endif
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL3_NewFrame();

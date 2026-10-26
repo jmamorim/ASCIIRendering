@@ -11,6 +11,7 @@ static std::string g_error;
 void encoderPrepare(VideoFormat)
 {
     g_error.clear();
+    g_closed = false;
 }
 
 bool encoderOpen(VideoFormat format, const std::string& path, int w, int h, const std::string& rate, double)
@@ -36,10 +37,13 @@ bool encoderOpen(VideoFormat format, const std::string& path, int w, int h, cons
     g_enc = SDL_CreateProcessWithProperties(props);
     SDL_DestroyProperties(props);
 
+    if (!g_enc)
+    {
+        g_error = "Could not start ffmpeg. It must be installed (on PATH).";
+        return false;
+    }
     g_path = path;
-    g_closed = false;
-    if (!g_enc) g_error = "Could not start ffmpeg. It must be installed (on PATH).";
-    return g_enc != nullptr;
+    return true;
 }
 
 bool encoderBusy()

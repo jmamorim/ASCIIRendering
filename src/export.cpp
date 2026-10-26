@@ -169,10 +169,11 @@ static struct
     bool wasPlaying = false;
 } E;
 
-// Back to normal playback where it was before the export
-static void endVideoExport(const char* error)
+// Back to normal playback where it was before the export. Unless `done`, the
+// encoder is stopped and its output thrown away.
+static void endVideoExport(const char* error, bool done = false)
 {
-    if (E.state != E.FINISHING || error) encoderAbort();
+    if (!done) encoderAbort();
     E.state = E.IDLE;
     E.pixels = {};
     SDL_GL_SetSwapInterval(1);
@@ -296,7 +297,7 @@ bool exportVideoFrame()
 
     int status = encoderPoll();
     if (status < 0) endVideoExport(encoderError().c_str());
-    else if (status > 0) endVideoExport(nullptr);
+    else if (status > 0) endVideoExport(nullptr, true);
     if (E.state != E.RUNNING || encoderBusy()) return true;
 
     // 1 = shown, 0 = not ready yet (try again next pass), -1 = past the end
@@ -322,7 +323,11 @@ bool exportVideoFrame()
     }
     else if (shown < 0)
     {
-        if (!E.opened) return endVideoExport("There were no frames to export."), true;
+        if (!E.opened)
+        {
+            endVideoExport("There were no frames to export.");
+            return true;
+        }
         encoderClose(); // the encoder finishes the file in the background; encoderPoll says when
         E.state = E.FINISHING;
     }

@@ -68,11 +68,11 @@ set(SOURCES
     src/file_picker.cpp
     src/export.cpp
     src/ui.cpp)
-# Video decoding: the browser's <video> element on the web, the ffmpeg program on desktop
+# Video decoding and encoding: the browser (<video>, WebCodecs) on the web, the ffmpeg program on desktop
 if(EMSCRIPTEN)
-    list(APPEND SOURCES src/video_web.cpp)
+    list(APPEND SOURCES src/video_web.cpp src/encoder_web.cpp)
 else()
-    list(APPEND SOURCES src/video_desktop.cpp)
+    list(APPEND SOURCES src/video_desktop.cpp src/encoder_desktop.cpp)
 endif()
 
 add_executable(ASCIIRendering WIN32 ${SOURCES} ${FONT_HEADER} ${SHADER_HEADER})

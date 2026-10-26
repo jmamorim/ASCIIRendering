@@ -9,7 +9,7 @@
 EM_JS_DEPS(encoder, "$stringToUTF8,$lengthBytesUTF8");
 
 EM_JS(void, jsEncPrepare, (int gif), {
-    const e = Module.asciiEnc = { error: '', ready: false, done: false, pending: 0 };
+    const e = Module.asciiEnc = { error: "", ready: false, done: false, pending: 0 };
     if (!gif && typeof VideoEncoder === 'undefined') {
         e.error = 'This browser cannot encode video (no WebCodecs). Try GIF, or another browser.';
         return;
@@ -116,7 +116,7 @@ EM_JS(int, jsEncPoll, (), {
 
 EM_JS(void, jsEncError, (char* out, int size), {
     const e = Module.asciiEnc;
-    stringToUTF8(e ? e.error : '', out, size);
+    stringToUTF8(e ? e.error : "", out, size);
 });
 
 EM_JS(void, jsEncAbort, (), {

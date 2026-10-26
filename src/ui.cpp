@@ -102,7 +102,6 @@ void drawUi(float dpi, ImFont* font)
     ImGui::SameLine();
     if (ImGui::Button("Copy text", ImVec2(half, 0)))
         copyToClipboard();
-#ifndef __EMSCRIPTEN__
     bool exporting = videoExportRunning();
     if (exporting) showVideoExportProgress();
     ImGui::BeginDisabled(exporting); // everything else stays as it is until the export ends
@@ -114,7 +113,6 @@ void drawUi(float dpi, ImFont* font)
         ImGui::EndDisabled();
     }
     else if (!exporting)
-#endif
     {
         ImGui::BeginDisabled(g_kind != M_IMAGE || g_lines.empty());
         if (ImGui::Button("Export image...", ImVec2(-1, 0)))
@@ -162,9 +160,7 @@ void drawUi(float dpi, ImFont* font)
 
     ImGui::Spacing();
     paintPreview();
-#ifndef __EMSCRIPTEN__
     ImGui::EndDisabled();
-#endif
     ImGui::EndChild();
 
     // Right: the ASCII output

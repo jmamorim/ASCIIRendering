@@ -54,11 +54,28 @@ add_custom_command(
 set(SHADER_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/ascii_frag.h)
 add_custom_command(
     OUTPUT ${SHADER_HEADER}
-    COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_CURRENT_SOURCE_DIR}/ASCIIRendering/ascii.frag
+    COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_CURRENT_SOURCE_DIR}/src/ascii.frag
             -DOUT=${SHADER_HEADER} -DNAME=ascii_frag -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed.cmake
-    DEPENDS ASCIIRendering/ascii.frag cmake/embed.cmake)
+    DEPENDS src/ascii.frag cmake/embed.cmake)
 
-add_executable(ASCIIRendering WIN32 ASCIIRendering/ASCIIRendering.cpp ${FONT_HEADER} ${SHADER_HEADER})
+set(SOURCES
+    src/main.cpp
+    src/gl.cpp
+    src/params.cpp
+    src/glyphs.cpp
+    src/ascii_pass.cpp
+    src/media.cpp
+    src/file_picker.cpp
+    src/export.cpp
+    src/ui.cpp)
+# Video decoding: the browser's <video> element on the web, the ffmpeg program on desktop
+if(EMSCRIPTEN)
+    list(APPEND SOURCES src/video_web.cpp)
+else()
+    list(APPEND SOURCES src/video_desktop.cpp)
+endif()
+
+add_executable(ASCIIRendering WIN32 ${SOURCES} ${FONT_HEADER} ${SHADER_HEADER})
 target_include_directories(ASCIIRendering PRIVATE ${stb_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(ASCIIRendering PRIVATE imgui SDL3::SDL3)
 if(MSVC)

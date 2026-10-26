@@ -20,6 +20,40 @@ The build needs CMake 3.24+, a C++20 compiler and internet access the first
 time: Dear ImGui, stb and (when it isn't installed) SDL3 are downloaded while
 configuring.
 
+## Project structure
+
+```text
+┌────────────────────┬──────────────────────────────────────────────────────────┐
+│        File        │                       What's in it                       │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ main.cpp           │ window, main loop, main()                                │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ app.h              │ g_window                                                 │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ gl.h/.cpp          │ OpenGL function loading                                  │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ params.h/.cpp      │ slider list P[], val()                                   │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ glyphs.h/.cpp      │ font, circle layout, glyph vectors, kd-tree lookup       │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ ascii_pass.h/.cpp  │ shader pass, renderAscii(), g_lines                      │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ media.h/.cpp       │ image/GIF loading, playback, video interface             │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ video_desktop.cpp  │ ffmpeg decoding (desktop build only)                     │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ video_web.cpp      │ <video> element decoding (web build only)                │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ file_picker.h/.cpp │ open-file dialog                                         │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ export.h/.cpp      │ clipboard, image export, your video export, export popup │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ ui.h/.cpp          │ left panel, painting the output, onParamsChanged()       │
+├────────────────────┼──────────────────────────────────────────────────────────┤
+│ ascii.frag         │ the shader, moved from the old folder                    │
+└────────────────────┴──────────────────────────────────────────────────────────┘
+```
+
 ## Windows
 
 1. Install [Visual Studio 2022](https://visualstudio.microsoft.com/) (Community

@@ -1,7 +1,7 @@
 // Parameters shown as sliders
 #pragma once
 
-enum { P_COLS, P_STEP, P_CONTRAST, P_RADIUS, P_STAGGER, P_FONT, P_COUNT };
+enum { P_COLS, P_STEP, P_CONTRAST, P_RADIUS, P_STAGGER, P_FONT, P_EDGE, P_COUNT };
 
 struct Param
 {

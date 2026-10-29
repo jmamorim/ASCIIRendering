@@ -37,6 +37,50 @@ float gray(ivec2 p)
 }
 
 // ---------------------------------------------------------------------------
+// Brightness change at one pixel: x = left->right, y = top->bottom
+// ---------------------------------------------------------------------------
+
+float grayClamped(ivec2 p){
+    return gray(clamp(p, ivec2(0), textureSize(uImage,0) - 1));
+} 
+
+vec2 sobel(ivec2 p)
+{
+    // the 3x3 neighbourhood:  a b c
+    //                         d . f
+    //                         g h i
+    float a = grayClamped(p + ivec2(-1, -1));
+    float b = grayClamped(p + ivec2( 0, -1));
+    float c = grayClamped(p + ivec2( 1, -1));
+    float d = grayClamped(p + ivec2(-1,  0));
+    float f = grayClamped(p + ivec2( 1,  0));
+    float g = grayClamped(p + ivec2(-1,  1));
+    float h = grayClamped(p + ivec2( 0,  1));
+    float i = grayClamped(p + ivec2( 1,  1));
+
+    float gx = (c + 2.0 * f + i) - (a + 2.0 * d + g); // right column - left column
+    float gy = (g + 2.0 * h + i) - (a + 2.0 * b + c); // bottom row - top row
+    return vec2(gx, gy);
+}
+
+// Average gradient of the cell; vectors are summed, so opposite edges cancel
+vec2 cellGradient(vec2 origin)
+{
+    ivec2 lo = ivec2(origin);
+    ivec2 hi = ivec2(origin + uCell);
+
+    vec2 sum = vec2(0.0);
+    int count = 0;
+    for(int y = lo.y; y < hi.y; y += uStep)
+        for(int x = lo.x; x < hi.x; x += uStep)
+        {
+            sum += sobel(ivec2(x,y));
+            ++count;
+        }
+    return count > 0 ? sum / float(count) : vec2(0.0);
+}
+
+// ---------------------------------------------------------------------------
 // Average lightness of the pixels inside one circle (sampleCircle)
 // ---------------------------------------------------------------------------
 float sampleCircle(vec2 origin, vec3 circ)
@@ -122,5 +166,6 @@ void main()
     }
 
     outV0123 = vec4(v[0], v[1], v[2], v[3]);
-    outV45   = vec4(v[4], v[5], 0.0, 0.0);
+    vec2 grad = cellGradient(origin);
+    outV45   = vec4(v[4], v[5], length(grad), atan(grad.y, grad.x));
 }

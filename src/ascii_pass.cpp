@@ -3,6 +3,7 @@
 #include "params.h"
 
 #include <SDL3/SDL.h>
+#include <cmath>
 #include <cstring>
 
 #ifdef __EMSCRIPTEN__
@@ -121,7 +122,7 @@ static void resizeTargets(int cols, int rows)
     p.v45.resize((size_t)cols * rows * 4);
 }
 
-std::vector<Vec> runPass(GLuint tex, int cols, int rows, float cw, float ch, int step, float exponent)
+std::vector<Cell> runPass(GLuint tex, int cols, int rows, float cw, float ch, int step, float exponent)
 {
     AsciiPass& p = g_pass;
     resizeTargets(cols, rows);
@@ -145,14 +146,27 @@ std::vector<Vec> runPass(GLuint tex, int cols, int rows, float cw, float ch, int
     glReadPixels(0, 0, cols, rows, GL_RGBA, GL_FLOAT, p.v45.data());
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    std::vector<Vec> out((size_t)cols * rows);
+    std::vector<Cell> out((size_t)cols * rows);
     for (size_t i = 0; i < out.size(); ++i)
     {
         const float* a = &p.v0123[i * 4];
         const float* b = &p.v45[i * 4];
-        out[i] = { a[0], a[1], a[2], a[3], b[0], b[1] };
+        out[i] = { {a[0], a[1], a[2], a[3], b[0], b[1]}, b[2], b[3] };
     }
     return out;
+}
+
+// Outline mode: a line character along the cell's edge, or a space when there is no edge
+static char edgeChar(float strength, float angle)
+{
+    if (strength < val(P_EDGE)) return ' ';
+
+    // The gradient points across the edge; the line runs 90° to it.
+    // Characters repeat every 180°, so fold the angle into 4 bins of 45°.
+    const float PI = 3.14159265f;
+    float a = angle + PI / 2.0f;
+    int bin = (int)std::lround(a / (PI / 4.0f)) & 3;
+    return "-\\|/"[bin];
 }
 
 void renderAscii()
@@ -163,18 +177,22 @@ void renderAscii()
     int cols = (int)(val(P_COLS) + 0.5f);
     int step = (int)(val(P_STEP) + 0.5f);
     float exponent = val(P_CONTRAST);
+    bool outlineMode = val(P_EDGE) > 0.0f; // threshold 0 = off
 
     float cw = (float)g_mediaW / cols;
     float ch = cw * 2.0f; // console characters are ~1:2
     int rows = (int)(g_mediaH / ch);
     if (rows <= 0) return;
 
-    std::vector<Vec> cells = runPass(g_image, cols, rows, cw, ch, step, exponent);
+    std::vector<Cell> cells = runPass(g_image, cols, rows, cw, ch, step, exponent);
     for (int r = 0; r < rows; ++r)
     {
         std::string line;
         for (int c = 0; c < cols; ++c)
-            line += findBestCharKd(cells[(size_t)r * cols + c]);
+        {   
+            const Cell& cell = cells[(size_t)r * cols + c]; 
+            line += outlineMode ? edgeChar(cell.strength, cell.angle) : findBestCharKd(cell.v);
+        }
         g_lines.push_back(line);
     }
 }

@@ -8,10 +8,12 @@
 #include <string>
 #include <vector>
 
+struct Cell {Vec v; float strength, angle;};
+
 extern std::vector<std::string> g_lines; // current ASCII output
 
 bool initAsciiPass();
-std::vector<Vec> runPass(GLuint tex, int cols, int rows, float cw, float ch, int step, float exponent);
+std::vector<Cell> runPass(GLuint tex, int cols, int rows, float cw, float ch, int step, float exponent);
 
 // Image -> lines of ASCII, using the current slider values
 void renderAscii();

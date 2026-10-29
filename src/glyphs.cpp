@@ -183,7 +183,7 @@ static std::vector<Glyph> buildGlyphs(float fontScale)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, aw, ah, 0, GL_RGBA, GL_UNSIGNED_BYTE, atlas.data());
 
     // Exponent 1 skips the contrast passes, glyphs are sampled as drawn
-    std::vector<Vec> vs = runPass(tex, cols, rows, (float)gw, (float)gh, 1, 1.0f);
+    std::vector<Cell> vs = runPass(tex, cols, rows, (float)gw, (float)gh, 1, 1.0f);
     glDeleteTextures(1, &tex);
 
     std::vector<Glyph> glyphs;
@@ -191,7 +191,7 @@ static std::vector<Glyph> buildGlyphs(float fontScale)
     {
         Glyph gl;
         gl.ch = (char)(32 + i);
-        gl.v = vs[(size_t)(2 * (i / perRow) + 1) * cols + 2 * (i % perRow) + 1];
+        gl.v = vs[(size_t)(2 * (i / perRow) + 1) * cols + 2 * (i % perRow) + 1].v;
         glyphs.push_back(gl);
     }
 

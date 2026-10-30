@@ -7,7 +7,7 @@ This project is an experiment that was inspired by Alex Harri's blog "ASCII char
 This app is available on the web: https://jmamorim.github.io/ASCIIRendering/
 
 Latest update:
-Export as video.
+Usage of color on the output
 
 ## Using it
 

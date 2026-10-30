@@ -13,6 +13,7 @@
 #include "ascii_frag.h" // ascii.frag, embedded at build time
 
 std::vector<std::string> g_lines;
+std::vector<std::vector<uint32_t>> g_colors;
 
 static const char* FULLSCREEN_VS = R"(
 void main()
@@ -25,10 +26,10 @@ void main()
 struct AsciiPass
 {
     GLuint prog = 0, vao = 0, fbo = 0;
-    GLuint out[2] = {};     // circles 0..3, circles 4..5
+    GLuint out[3] = {};     // circles 0..3, circles 4..5 + edge, color
     int cols = 0, rows = 0;
     GLint uImage, uCell, uCircles, uExt, uExponent, uStep;
-    std::vector<float> v0123, v45;
+    std::vector<float> v0123, v45, color;
 };
 static AsciiPass g_pass;
 
@@ -88,7 +89,7 @@ bool initAsciiPass()
 
     glGenVertexArrays(1, &p.vao);
     glGenFramebuffers(1, &p.fbo);
-    glGenTextures(2, p.out);
+    glGenTextures(3, p.out);
 
 #ifdef __EMSCRIPTEN__
     // WebGL 2 can only render to float textures with this
@@ -103,7 +104,7 @@ static void resizeTargets(int cols, int rows)
     if (cols == p.cols && rows == p.rows) return;
 
     glBindFramebuffer(GL_FRAMEBUFFER, p.fbo);
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < 3; ++i)
     {
         glBindTexture(GL_TEXTURE_2D, p.out[i]);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -111,8 +112,8 @@ static void resizeTargets(int cols, int rows)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, cols, rows, 0, GL_RGBA, GL_FLOAT, nullptr);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, p.out[i], 0);
     }
-    const GLenum bufs[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
-    glDrawBuffers(2, bufs);
+    const GLenum bufs[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
+    glDrawBuffers(3, bufs);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         SDL_Log("ASCII framebuffer is incomplete");
 
@@ -120,6 +121,7 @@ static void resizeTargets(int cols, int rows)
     p.rows = rows;
     p.v0123.resize((size_t)cols * rows * 4);
     p.v45.resize((size_t)cols * rows * 4);
+    p.color.resize((size_t)cols * rows * 4);
 }
 
 std::vector<Cell> runPass(GLuint tex, int cols, int rows, float cw, float ch, int step, float exponent)
@@ -144,6 +146,8 @@ std::vector<Cell> runPass(GLuint tex, int cols, int rows, float cw, float ch, in
     glReadPixels(0, 0, cols, rows, GL_RGBA, GL_FLOAT, p.v0123.data());
     glReadBuffer(GL_COLOR_ATTACHMENT1);
     glReadPixels(0, 0, cols, rows, GL_RGBA, GL_FLOAT, p.v45.data());
+    glReadBuffer(GL_COLOR_ATTACHMENT2);
+    glReadPixels(0, 0, cols, rows, GL_RGBA, GL_FLOAT, p.color.data());
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     std::vector<Cell> out((size_t)cols * rows);
@@ -151,7 +155,10 @@ std::vector<Cell> runPass(GLuint tex, int cols, int rows, float cw, float ch, in
     {
         const float* a = &p.v0123[i * 4];
         const float* b = &p.v45[i * 4];
-        out[i] = { {a[0], a[1], a[2], a[3], b[0], b[1]}, b[2], b[3] };
+        const float* c = &p.color[i * 4];
+        uint32_t color = (uint32_t)(c[0] * 255) | (uint32_t)(c[1] * 255) << 8
+               | (uint32_t)(c[2] * 255) << 16 | 0xFF000000u;
+        out[i] = { {a[0], a[1], a[2], a[3], b[0], b[1]}, b[2], b[3], color };
     }
     return out;
 }
@@ -172,6 +179,7 @@ static char edgeChar(float strength, float angle)
 void renderAscii()
 {
     g_lines.clear();
+    g_colors.clear();
     if (!g_imageReady || !g_pass.prog) return;
 
     int cols = (int)(val(P_COLS) + 0.5f);
@@ -188,11 +196,14 @@ void renderAscii()
     for (int r = 0; r < rows; ++r)
     {
         std::string line;
+        std::vector<uint32_t> lineColors;
         for (int c = 0; c < cols; ++c)
         {   
             const Cell& cell = cells[(size_t)r * cols + c]; 
             line += outlineMode ? edgeChar(cell.strength, cell.angle) : findBestCharKd(cell.v);
+            lineColors.push_back(cell.color);
         }
         g_lines.push_back(line);
+        g_colors.push_back(lineColors);
     }
 }

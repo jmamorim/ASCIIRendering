@@ -7,7 +7,7 @@ Param P[P_COUNT] = {
     { "Circle radius",   15,  45,  30, 0.01f, 2 },
     { "Stagger",          0,  10,   4, 0.01f, 2 },
     { "Glyph font size", 50, 100,  80, 0.01f, 2 },
-    { "Edge threshold",   0, 100,   0, 0.01f, 2 }, // 0 = outline mode off
+    { "Edge threshold",   0, 50,   0, 0.01f, 2 }, // 0 = outline mode off
 };
 
 float val(int i)

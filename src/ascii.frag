@@ -26,6 +26,7 @@ uniform int   uStep;           // P_STEP
 // Two render targets so each cell is sampled once.
 layout(location = 0) out vec4 outV0123; // circles 0..3
 layout(location = 1) out vec4 outV45;   // circles 4..5 in .xy
+layout(location = 2) out vec4 outColor; // average rgb of cell
 
 // ---------------------------------------------------------------------------
 // RGBA pixel -> lightness (toGray)
@@ -64,19 +65,23 @@ vec2 sobel(ivec2 p)
 }
 
 // Average gradient of the cell; vectors are summed, so opposite edges cancel
-vec2 cellGradient(vec2 origin)
+vec2 cellGradient(vec2 origin, out vec3 avgRgb)
 {
     ivec2 lo = ivec2(origin);
     ivec2 hi = ivec2(origin + uCell);
 
     vec2 sum = vec2(0.0);
+    vec3 sumRGB = vec3(0.0);
     int count = 0;
     for(int y = lo.y; y < hi.y; y += uStep)
         for(int x = lo.x; x < hi.x; x += uStep)
         {
             sum += sobel(ivec2(x,y));
+            vec4 c = texelFetch(uImage, ivec2(x, y), 0);
+            sumRGB += c.rgb * c.a;
             ++count;
         }
+    avgRgb = count > 0 ? sumRGB / float(count) : vec3(0.0);
     return count > 0 ? sum / float(count) : vec2(0.0);
 }
 
@@ -166,6 +171,8 @@ void main()
     }
 
     outV0123 = vec4(v[0], v[1], v[2], v[3]);
-    vec2 grad = cellGradient(origin);
+    vec3 avgRgb;
+    vec2 grad = cellGradient(origin, avgRgb);
     outV45   = vec4(v[4], v[5], length(grad), atan(grad.y, grad.x));
+    outColor = vec4(avgRgb, 1.0);
 }

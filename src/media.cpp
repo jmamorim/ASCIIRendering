@@ -55,6 +55,7 @@ void startMedia(MediaKind kind, double duration)
     g_frameShown = -1;
     g_imageReady = false;
     g_lines.clear();
+    g_colors.clear();
 }
 
 static bool loadImage(const std::string& path)

@@ -12,6 +12,8 @@
 
 static const float PANEL_W = 300; // before DPI scaling
 
+static bool g_colorOutput = false; // characters in the cell's color instead of white
+
 void onParamsChanged()
 {
     // Glyph shape vectors only depend on these three, so only rebuild if they changed
@@ -64,8 +66,16 @@ static void paintAscii(ImFont* font)
     g_asciiMax = ImVec2(p.x + (float)(cols * cell), p.y + (float)(rows * cell * 2));
 
     for (int i = 0; i < rows; ++i)
-        dl->AddText(font, fontSize, ImVec2(p.x, p.y + (float)(i * cell * 2)),
-            IM_COL32(255, 255, 255, 255), g_lines[i].c_str());
+    {
+        for(int c = 0; c < cols; ++c)
+        {
+        const char* ch = &g_lines[i][c];
+        if(*ch == ' ') continue;
+        dl->AddText(font, fontSize, ImVec2(p.x + (float)(c * cell), p.y + (float)(i * cell * 2)),
+            g_colorOutput ? g_colors[i][c] : IM_COL32(255, 255, 255, 255), ch, ch + 1);
+
+        }
+    }
 }
 
 static void paintPreview()
@@ -157,6 +167,8 @@ void drawUi(float dpi, ImFont* font)
         ImGui::PopID();
     }
     if (changed) onParamsChanged();
+
+    ImGui::Checkbox("Color", &g_colorOutput); // only changes the painting, no re-render needed
 
     ImGui::Spacing();
     paintPreview();
